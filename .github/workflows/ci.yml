@@ -1,0 +1,114 @@
+name: Splash runtime CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_gate:
+        description: Run the real-model release gate on the Apple Silicon hardware matrix
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: runtime-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+permissions:
+  contents: read
+
+jobs:
+  engine-check:
+    name: Production, CPU runtime, and sanitizers
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Build production and run CPU runtime checks
+        run: make check-source check-native-cpu PYTHON_CANDIDATES=python3
+      - name: Run native sanitizers
+        run: make test-sanitizers
+
+  python-compatibility:
+    name: Python compatibility ${{ matrix.python-version }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            install/requirements.txt
+            dev/requirements.txt
+      - name: Run current runtime Python, model-manifest, and source checks
+        run: |
+          make check-python-engine PYTHON_CANDIDATES=python3
+          actual=$(.venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+          test "$actual" = "${{ matrix.python-version }}"
+
+  release-hardware:
+    name: Release gate (${{ matrix.runner_label }}, ${{ matrix.model }})
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_gate == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        model:
+          - incoai/Qwen3.8-27B-Splash
+          - incoai/Qwen3.6-35B-A3B-Splash
+        runner_label:
+          - splash-m3-max-48
+          - splash-m4-pro-48
+          - splash-m4-max-64plus
+          - splash-m5-pro-48
+          - splash-m5-pro-64
+          - splash-m5-max-48
+          - splash-m5-max-64plus
+    runs-on: [self-hosted, macOS, ARM64, "${{ matrix.runner_label }}"]
+    env:
+      MODEL: ${{ matrix.model }}
+    # Older Apple GPUs can spend substantially longer in the real context and
+    # quality gates. The matrix must fail on an engine/test result, not an
+    # arbitrary job timer.
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Self-hosted release machines keep the manifest-pinned packed
+          # models in the ignored install/models/ directory. A clean checkout runs
+          # git clean -ffdx and destroys that multi-gigabyte prepared input;
+          # release-check still rejects tracked/untracked source changes and
+          # verify-models performs a full content hash before inference.
+          clean: false
+      - name: Prepare the selected model
+        run: make install PYTHON_CANDIDATES=python3
+      - name: Run the complete Splash runtime release gate
+        run: |
+          make release-check PYTHON_CANDIDATES=python3
+      - name: Record the physical GPU prefill and decode kernel sweeps
+        if: success()
+        run: |
+          mkdir -p build/release
+          make benchmark-prefill | tee build/release/q4-prefill-profile.txt
+          make benchmark-decode | tee build/release/q4-decode-profile.txt
+      - name: Preserve release reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-release-${{ runner.name }}-${{ strategy.job-index }}-${{ github.sha }}
+          path: |
+            build/release/agent-real.json
+            build/release/backend-benchmark.json
+            build/release/q4-prefill-profile.txt
+            build/release/q4-decode-profile.txt
+          if-no-files-found: ignore
