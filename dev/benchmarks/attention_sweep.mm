@@ -1,0 +1,421 @@
+// Times Splash's production attention kernels on one layer of Page32 Q8 KV
+// across cache lengths, for the prefill chunk (2048 rows), and the DFlash
+// verify batch (8 rows per lane, one and four lanes). Each case builds the same
+// store + attention graph the executor encodes, reports the fused GPU time of
+// the whole graph and, with dispatch profiling, the GPU time of each pipeline
+// over deterministic synthetic history. These are kernel
+// timings, not a correctness oracle (the tuning tests are).
+//
+// usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b]
+//                        [--lanes 1,4] [--repeat N]
+#include "metal/CommandGraph.hpp"
+#include "metal/MetalBackend.hpp"
+#include "ops/ExecutionPlans.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <charconv>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+using namespace splash;
+using namespace splash::ops;
+
+constexpr uint64_t kAlignment = 16 * 1024;
+constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+constexpr uint32_t kDimension = 256;
+constexpr uint32_t kPageRows = kv::kPageTokens;
+constexpr uint32_t kVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
+constexpr uint32_t kPrefillRows = SPLASH_PREFILL_TOKEN_BUDGET;
+
+enum class Tensor : uint32_t {
+  Keys, KeyScales, Values, ValueScales, ChunkKeys, ChunkValues,
+  Queries, Output, Partials, Statistics, Table0, Table1, Table2, Table3, Count
+};
+constexpr size_t tensorIndex(Tensor tensor) { return static_cast<size_t>(tensor); }
+constexpr size_t kTensorCount = tensorIndex(Tensor::Count);
+
+uint64_t aligned(uint64_t bytes) {
+  return (bytes + kAlignment - 1) & ~(kAlignment - 1);
+}
+uint16_t bf16(float value) {
+  uint32_t bits = std::bit_cast<uint32_t>(value);
+  bits += 0x7fff + ((bits >> 16) & 1);
+  return uint16_t(bits >> 16);
+}
+
+struct Plan final {
+  AttentionShape shape;
+  bool prefill = false;
+  VerifyAttentionConfig verify;
+  uint32_t lanes = 0;
+  uint32_t rows = 0;
+  uint32_t stride = 0;
+  uint32_t physicalPages = 0;
+  std::array<uint32_t, kMaximumLanes> histories{};
+  std::array<uint32_t, kMaximumLanes> pages{};
+  std::array<uint64_t, kTensorCount> sizes{};
+  uint64_t bytes = 0;
+
+  kv::Q8Layout layout() const { return {1, shape.kvHeads, shape.headDimension}; }
+  // The verify plan scales each lane's split count with its own history.
+  std::span<const uint32_t> laneHistories() const { return {histories.data(), lanes}; }
+  void size(Tensor tensor, uint64_t value) { sizes[tensorIndex(tensor)] = value; }
+};
+
+Plan makePlan(AttentionShape shape, bool prefill, uint32_t lanes, uint32_t history,
+              VerifyAttentionConfig verify = {}) {
+  if (!lanes || lanes > kMaximumLanes)
+    throw std::invalid_argument("--lanes must contain values from 1 to 4");
+  Plan plan;
+  plan.shape = shape;
+  plan.prefill = prefill;
+  plan.verify = verify;
+  plan.lanes = prefill ? 1 : lanes;
+  plan.rows = prefill ? kPrefillRows : kVerifyRows;
+  for (uint32_t lane = 0; lane < plan.lanes; ++lane) plan.histories[lane] = history;
+  AttentionWorkspace scratch;
+  if (prefill) {
+    scratch = PagedAttention::prefillPlan(plan.rows, shape.queryHeads, plan.layout(),
+                                          history, PrefillAttentionConfig{})
+                  .workspace;
+  } else {
+    scratch = PagedAttention::verifyPlan(plan.lanes, shape.queryHeads, plan.layout(),
+                                         plan.laneHistories(), verify)
+                  .workspace;
+  }
+  plan.stride = (plan.rows + kPageRows - 1) / kPageRows * kPageRows;
+  uint32_t pages = 0;
+  for (uint32_t lane = 0; lane < plan.lanes; ++lane) {
+    const uint64_t tokens = uint64_t{plan.histories[lane]} + plan.rows;
+    if (tokens > kv::kMaximumPhysicalTokens)
+      throw std::invalid_argument("history exceeds the KV context");
+    plan.pages[lane] = uint32_t((tokens + kPageRows - 1) / kPageRows);
+    pages += plan.pages[lane];
+    plan.size(static_cast<Tensor>(tensorIndex(Tensor::Table0) + lane),
+              uint64_t{plan.pages[lane]} * sizeof(uint32_t));
+  }
+  plan.physicalPages = pages + 1 + (pages % 2);
+  plan.size(Tensor::Keys, plan.physicalPages * plan.layout().dataBytesPerLayerPage());
+  plan.size(Tensor::Values, plan.physicalPages * plan.layout().dataBytesPerLayerPage());
+  plan.size(Tensor::KeyScales, plan.physicalPages * plan.layout().scaleBytesPerLayerPage());
+  plan.size(Tensor::ValueScales, plan.physicalPages * plan.layout().scaleBytesPerLayerPage());
+  const uint64_t chunks = uint64_t{plan.lanes} * shape.kvHeads * plan.stride * kDimension * 2;
+  const uint64_t queries = uint64_t{plan.lanes} * shape.queryHeads * plan.stride * kDimension * 2;
+  plan.size(Tensor::ChunkKeys, chunks);
+  plan.size(Tensor::ChunkValues, chunks);
+  plan.size(Tensor::Queries, queries);
+  plan.size(Tensor::Output, queries);
+  plan.size(Tensor::Partials, scratch.partialsBytes);
+  plan.size(Tensor::Statistics, scratch.statisticsBytes);
+  for (uint64_t size : plan.sizes) plan.bytes += aligned(size);
+  return plan;
+}
+
+class Fixture final {
+public:
+  Fixture(metal::MetalBackend &backend, Plan plan)
+      : plan_(std::move(plan)),
+        base_(backend.allocateBuffer(plan_.bytes, metal::BufferStorage::Shared,
+                                     "attention-sweep-fixture")) {
+    uint64_t offset = 0;
+    for (size_t i = 0; i < plan_.sizes.size(); ++i) {
+      if (plan_.sizes[i]) buffers_[i] = backend.view(base_, offset, plan_.sizes[i]);
+      offset += aligned(plan_.sizes[i]);
+    }
+    layer_ = {get(Tensor::Keys), get(Tensor::KeyScales), get(Tensor::Values),
+              get(Tensor::ValueScales)};
+    for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
+      tables_[lane] = get(static_cast<Tensor>(tensorIndex(Tensor::Table0) + lane));
+      stores_[lane] = {plan_.histories[lane], plan_.rows, plan_.stride, plan_.pages[lane],
+                       plan_.physicalPages, 0, 0, 0};
+      attention_[lane] = kv::q8VerifyAttentionParams(
+          plan_.histories[lane], kVerifyRows, plan_.stride, plan_.pages[lane],
+          plan_.physicalPages);
+    }
+    for (uint32_t lane = plan_.lanes; lane < kMaximumLanes; ++lane) {
+      tables_[lane] = tables_[0];
+      stores_[lane] = stores_[0];
+      attention_[lane] = attention_[0];
+    }
+    initialize();
+  }
+
+  metal::CommandGraph graph() const {
+    metal::CommandGraph result;
+    if (plan_.prefill) {
+      const auto attentionPlan = PagedAttention::prefillPlan(
+          plan_.rows, plan_.shape.queryHeads, plan_.layout(), plan_.histories[0],
+          PrefillAttentionConfig{});
+      PagedAttention::addPrefillStore(result, layer_, get(Tensor::ChunkKeys),
+                                      get(Tensor::ChunkValues), tables_[0], stores_[0],
+                                      plan_.layout());
+      PagedAttention::addPrefill(result, layer_, get(Tensor::Queries), get(Tensor::Output),
+                                 get(Tensor::Partials), get(Tensor::Statistics), tables_[0],
+                                 stores_[0], attentionPlan);
+    } else {
+      const auto attentionPlan = PagedAttention::verifyPlan(
+          plan_.lanes, plan_.shape.queryHeads, plan_.layout(), plan_.laneHistories(),
+          plan_.verify);
+      PagedAttention::addVerify(
+          result, layer_,
+          {get(Tensor::ChunkKeys), get(Tensor::ChunkValues), get(Tensor::Queries),
+           get(Tensor::Partials), get(Tensor::Statistics), get(Tensor::Output), tables_},
+          stores_, attention_, attentionPlan);
+    }
+    return result;
+  }
+
+  uint64_t historyBytesInt8() const {
+    // Key and value int8 payload plus one float scale per 32-token page row.
+    uint64_t tokens = 0;
+    for (uint32_t lane = 0; lane < plan_.lanes; ++lane)
+      tokens += uint64_t{plan_.histories[lane]} + plan_.rows;
+    return tokens * plan_.shape.kvHeads * (2 * kDimension + 2 * sizeof(float));
+  }
+
+private:
+  void initialize() {
+    std::memset(base_.contents(), 0, plan_.bytes);
+    auto *keys = static_cast<int8_t *>(get(Tensor::Keys).contents());
+    auto *values = static_cast<int8_t *>(get(Tensor::Values).contents());
+    auto *keyScales = static_cast<float *>(get(Tensor::KeyScales).contents());
+    auto *valueScales = static_cast<float *>(get(Tensor::ValueScales).contents());
+    auto *chunkKeys = static_cast<uint16_t *>(get(Tensor::ChunkKeys).contents());
+    auto *chunkValues = static_cast<uint16_t *>(get(Tensor::ChunkValues).contents());
+    auto *queries = static_cast<uint16_t *>(get(Tensor::Queries).contents());
+    const uint32_t group = plan_.shape.queryHeads / plan_.shape.kvHeads;
+    uint32_t firstPage = 0;
+    for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
+      auto *table = static_cast<uint32_t *>(tables_[lane].contents());
+      for (uint32_t page = 0; page < plan_.pages[lane]; ++page)
+        table[page] = (2 * (firstPage + page) + 1) % plan_.physicalPages;
+      firstPage += plan_.pages[lane];
+      for (uint32_t token = 0; token < plan_.histories[lane]; ++token) {
+        for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
+          const uint64_t scale =
+              (uint64_t{table[token / kPageRows]} * plan_.shape.kvHeads + head) * kPageRows +
+              token % kPageRows;
+          keyScales[scale] = 0.006f;
+          valueScales[scale] = 0.007f;
+          for (uint32_t d = 0; d < kDimension; ++d) {
+            keys[scale * kDimension + d] =
+                int((uint64_t{token} * 37 + head * 101 + d * 17 + lane * 7) % 255) - 127;
+            values[(scale / kPageRows * kDimension + d) * kPageRows + scale % kPageRows] =
+                int((uint64_t{token} * 53 + head * 79 + d * 29 + lane * 19) % 255) - 127;
+          }
+        }
+      }
+      for (uint32_t row = 0; row < plan_.rows; ++row) {
+        for (uint32_t head = 0; head < plan_.shape.kvHeads; ++head) {
+          const uint64_t base =
+              (uint64_t{lane} * plan_.shape.kvHeads + head) * plan_.stride * kDimension;
+          for (uint32_t d = 0; d < kDimension; ++d) {
+            chunkKeys[base + row * kDimension + d] =
+                bf16(float(int((row * 37 + head * 101 + d * 17 + lane * 7) % 255) - 127) * 0.006f);
+            chunkValues[base + d * plan_.stride + row] =
+                bf16(float(int((row * 53 + head * 79 + d * 29 + lane * 19) % 255) - 127) * 0.007f);
+          }
+        }
+        for (uint32_t head = 0; head < plan_.shape.queryHeads; ++head)
+          for (uint32_t d = 0; d < kDimension; ++d) {
+            const uint64_t index =
+                (((uint64_t{lane} * plan_.shape.kvHeads + head / group) * plan_.stride + row) *
+                     group +
+                 head % group) *
+                    kDimension +
+                d;
+            queries[index] = bf16(
+                float(int((row * 43 + head * 67 + d * 11 + head * d * 7 + lane * 29) % 1019) -
+                      509) /
+                1018.0f);
+          }
+      }
+    }
+  }
+
+  metal::MetalBuffer get(Tensor tensor) const { return buffers_[tensorIndex(tensor)]; }
+
+  Plan plan_;
+  metal::MetalBuffer base_;
+  std::array<metal::MetalBuffer, kTensorCount> buffers_{};
+  kv::Q8LayerStorage layer_;
+  std::array<metal::MetalBuffer, kMaximumLanes> tables_{};
+  std::array<kv::Q8ChunkedPrefillParams, kMaximumLanes> stores_{};
+  std::array<kv::Q8VerifyAttentionParams, kMaximumLanes> attention_{};
+};
+
+struct Case final {
+  double fusedMilliseconds = 0.0;
+  std::map<std::string, double> pipelineMilliseconds;
+  uint64_t int8Bytes = 0;
+};
+
+double median(std::vector<double> values) {
+  std::sort(values.begin(), values.end());
+  return values[values.size() / 2];
+}
+
+Case measure(metal::MetalBackend &backend, const Plan &plan, uint32_t repeat) {
+  Fixture fixture(backend, plan);
+  const metal::CommandGraph graph = fixture.graph();
+  Case result;
+  result.int8Bytes = fixture.historyBytesInt8();
+  for (uint32_t i = 0; i < 2; ++i) static_cast<void>(backend.submitCommand(graph.dispatches()));
+  std::vector<double> fused;
+  for (uint32_t i = 0; i < repeat; ++i)
+    fused.push_back(backend.submitCommand(graph.dispatches()).gpuSeconds * 1000.0);
+  result.fusedMilliseconds = median(fused);
+  std::map<std::string, std::vector<double>> perPipeline;
+  backend.setDispatchProfiling(true);
+  for (uint32_t i = 0; i < repeat; ++i) {
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    std::map<std::string, double> run;
+    for (const metal::DispatchTiming &timing : backend.takeDispatchProfile())
+      run[timing.pipelineName] += timing.gpuSeconds * 1000.0;
+    for (const auto &[name, milliseconds] : run) perPipeline[name].push_back(milliseconds);
+  }
+  backend.setDispatchProfiling(false);
+  for (auto &[name, samples] : perPipeline) result.pipelineMilliseconds[name] = median(samples);
+  return result;
+}
+
+uint32_t parseCount(std::string_view text, uint32_t minimum, uint32_t maximum,
+                    std::string_view option) {
+  uint32_t value = 0;
+  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+      value < minimum || value > maximum)
+    throw std::invalid_argument(std::string(option) + " requires integers from " +
+                                std::to_string(minimum) + " to " + std::to_string(maximum));
+  return value;
+}
+
+std::vector<uint32_t> parseList(const std::string &text, uint32_t minimum,
+                                uint32_t maximum, std::string_view option) {
+  std::vector<uint32_t> values;
+  size_t start = 0;
+  while (start <= text.size()) {
+    const size_t comma = text.find(',', start);
+    const std::string item = text.substr(start, comma == std::string::npos ? std::string::npos
+                                                                            : comma - start);
+    values.push_back(parseCount(item, minimum, maximum, option));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return values;
+}
+
+std::string json(const Case &item, const std::string &shape, uint32_t history,
+                 const std::string &kind, uint32_t lanes) {
+  std::string out = "{\"shape\":\"" + shape + "\",\"history\":" + std::to_string(history) +
+                    ",\"kind\":\"" + kind + "\",\"lanes\":" + std::to_string(lanes) +
+                    ",\"fused_ms\":" + std::to_string(item.fusedMilliseconds) +
+                    ",\"int8_kv_bytes\":" + std::to_string(item.int8Bytes) + ",\"pipelines\":{";
+  bool first = true;
+  for (const auto &[name, milliseconds] : item.pipelineMilliseconds) {
+    out += (first ? "" : ",") + std::string("\"") + name + "\":" + std::to_string(milliseconds);
+    first = false;
+  }
+  return out + "}}";
+}
+
+} // namespace
+
+int main(int argc, const char *argv[]) {
+  try {
+    if (argc < 2) {
+      std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b] "
+                   "[--lanes LIST] [--repeat N]\n";
+      return 64;
+    }
+    std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
+    std::vector<uint32_t> lanes{1, 4};
+    std::vector<std::string> shapes{"27b", "35b"};
+    uint32_t repeat = 5;
+    for (int index = 2; index < argc; index += 2) {
+      const std::string option(argv[index]);
+      if (index + 1 >= argc)
+        throw std::invalid_argument(option + " requires a value");
+      if (option == "--histories")
+        histories = parseList(argv[index + 1], 0,
+                              kv::kMaximumPhysicalTokens - kPrefillRows, option);
+      else if (option == "--lanes")
+        lanes = parseList(argv[index + 1], 1, kMaximumLanes, option);
+      else if (option == "--repeat")
+        repeat = parseCount(argv[index + 1], 1, std::numeric_limits<uint32_t>::max(), option);
+      else if (option == "--shapes") {
+        shapes.clear();
+        std::string text(argv[index + 1]);
+        size_t start = 0;
+        while (start <= text.size()) {
+          const size_t comma = text.find(',', start);
+          const std::string shape =
+              text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+          if (shape != "27b" && shape != "35b")
+            throw std::invalid_argument("--shapes takes 27b or 35b");
+          shapes.push_back(shape);
+          if (comma == std::string::npos) break;
+          start = comma + 1;
+        }
+      } else throw std::invalid_argument("unknown option " + option);
+    }
+    metal::MetalBackend backend(argv[1]);
+    std::cerr << "device " << backend.capabilities().deviceName << ", one attention layer, "
+              << "Page32 Q8 KV, median of " << repeat << " fused graphs (ms)\n";
+    std::cout << "{\"device\":\"" << backend.capabilities().deviceName << "\",\"cases\":[";
+    bool firstCase = true;
+    for (const std::string &shape : shapes) {
+      const AttentionShape geometry = shape == "27b" ? AttentionShape{24, 4, 256}
+                                                     : AttentionShape{16, 2, 256};
+      const std::string name = shape == "27b" ? "qwen3.8-27b" : "qwen3.6-35b-a3b";
+      std::cerr << "\n" << name << "  (" << geometry.queryHeads << " query heads, "
+                << geometry.kvHeads << " KV heads, d=" << geometry.headDimension << ")\n";
+      std::cerr << "  history   prefill2048 fused | store | attention split | reduce   ";
+      for (uint32_t lane : lanes)
+        std::cerr << "| verify8 x" << lane << " fused | split | reduce ";
+      std::cerr << "\n";
+      for (uint32_t history : histories) {
+        const Case prefill =
+            measure(backend, makePlan(geometry, true, 1, history), repeat);
+        const auto pick = [](const Case &item, const std::string &needle) {
+          double total = 0.0;
+          for (const auto &[pipeline, milliseconds] : item.pipelineMilliseconds)
+            if (pipeline.find(needle) != std::string::npos) total += milliseconds;
+          return total;
+        };
+        std::cerr << "  " << history << "\t" << prefill.fusedMilliseconds << " | "
+                  << pick(prefill, "store") << " | " << pick(prefill, "_q8_split") << " | "
+                  << pick(prefill, "_q8_reduce") << "   ";
+        std::cout << (firstCase ? "" : ",") << json(prefill, name, history, "prefill", 1);
+        firstCase = false;
+        VerifyAttentionConfig configuration;
+        for (uint32_t lane : lanes) {
+          const Case verify = measure(
+              backend, makePlan(geometry, false, lane, history, configuration),
+              repeat);
+          std::cerr << "| " << verify.fusedMilliseconds << " | " << pick(verify, "_q8_split")
+                    << " | " << pick(verify, "_q8_reduce") << " ";
+          std::cout << "," << json(verify, name, history, "verify", lane);
+        }
+        std::cerr << "\n";
+      }
+    }
+    std::cout << "]}\n";
+    return 0;
+  } catch (const std::exception &error) {
+    std::cerr << "attention-sweep: " << error.what() << '\n';
+    return 70;
+  }
+}
