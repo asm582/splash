@@ -41,7 +41,8 @@ jobs:
           sw_vers
           uname -m
           xcrun -sdk macosx --show-sdk-version
-          xcrun -sdk macosx -f metal metallib clang++
+          for tool in metal metallib clang++; do xcrun -sdk macosx -f "$tool"; done
+        continue-on-error: true
       - name: Start SSH session (tmate)
         uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3.24
         with:
