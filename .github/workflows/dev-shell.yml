@@ -1,0 +1,48 @@
+name: Apple Silicon dev shell
+
+# Manually-triggered interactive shell on a GitHub-hosted Apple Silicon
+# runner, for building/testing Splash without owning or renting a Mac.
+# macOS Actions minutes are billed at a 10x multiplier against the
+# account's included minutes, so this is scoped to workflow_dispatch only
+# and defaults to a short session.
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: How long to keep the shell open before the job is killed
+        required: false
+        type: choice
+        default: "30"
+        options: ["15", "30", "60", "90"]
+
+concurrency:
+  group: dev-shell
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dev-shell:
+    name: Interactive shell (macos-26)
+    runs-on: macos-26
+    timeout-minutes: ${{ fromJSON(inputs.session_minutes) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            install/requirements.txt
+            dev/requirements.txt
+      - name: Print environment
+        run: |
+          sw_vers
+          uname -m
+          xcrun -sdk macosx --show-sdk-version
+          xcrun -sdk macosx -f metal metallib clang++
+      - name: Start SSH session (tmate)
+        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3.24
+        with:
+          limit-access-to-actor: true
