@@ -51,6 +51,36 @@ Source `install/completions/splash.bash` for Bash or
 `install/completions/_splash` for Zsh after `compinit`. Completion suggests
 commands, bundled official model IDs and installed models without network access.
 
+## Server configuration
+
+The default listener is `127.0.0.1:8000`. To accept LAN connections:
+
+```sh
+splash serve --model incoai/Qwen3.8-27B-Splash --host 0.0.0.0 --api-key YOUR_KEY
+```
+
+Connect to the server's LAN IP. `--host` selects the IPv4 bind address;
+`--allowed-host NAME` accepts an additional HTTP Host name, such as a custom DNS
+name or proxy hostname. It does not change the listener or allowlist client IPs.
+
+Use `--port 8001` or set `SPLASH_PORT=8001` to select another port. Set the same
+`SPLASH_PORT` in the local agent shell. Separate ports allow separate servers;
+their memory limits are independent. The packaged agent launchers connect to
+loopback, so use a listener that includes loopback when launching agents locally.
+
+## Model cache
+
+To download new models to another disk, set the cache location before serving:
+
+```sh
+HF_HUB_CACHE=/Volumes/Models/huggingface splash serve --model incoai/Qwen3.8-27B-Splash
+```
+
+`HF_HUB_CACHE` selects the Hugging Face download cache. Alternatively, set
+`HF_HOME` to relocate the Hugging Face home directory, including its default
+`hub` cache. Model links and agent sessions stay in Splash's data directory;
+existing downloads are not moved.
+
 ## Model packages
 
 Packages contain `manifest.json`, packed `target/`, `draft/`, `vision/` weights
@@ -233,6 +263,12 @@ System One validation uses 422 `detail` arrays; successful responses contain
 discovery reports an empty `release_date` because packages do not record one.
 The official SDK is a client only, not a server dependency. API compatibility does
 not imply Jev weights, accuracy, proprietary confidence semantics or calibration.
+
+These are local model scores, not calibrated confidence. Probabilities are a
+softmax over the declared answer slots. Choice/score `confidence` is normalized
+entropy concentration, `1 - H(p) / log(K)`, not an estimate of correctness.
+Score answers are probability-weighted level indices. Measure accuracy and
+calibrate on representative held-out data before using decision thresholds.
 
 Native wire version 6 appends score-token IDs to requests and selected f32 logits
 to Done events; a version mismatch is fatal. Scoring requires 2–255 distinct,
