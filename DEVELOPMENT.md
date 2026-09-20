@@ -1,7 +1,10 @@
 # Development
 
-Use Apple Silicon with macOS 26.4+, Xcode 26 or newer with Metal tools, and
-Python 3.12–3.14. Packaged users need none of these development tools.
+Use Apple Silicon with macOS 26.4+, Xcode 26 or newer, Python 3.12–3.14,
+and a Metal 4 compiler with `uint4b_format` tensor support.
+The macOS 26.2 SDK can compile the host code, but Xcode 26.2's default Metal
+component cannot compile the kernels; select a newer Metal toolchain when
+using that SDK. Packaged users need none of these development tools.
 
 ## Build and run
 
