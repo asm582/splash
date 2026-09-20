@@ -76,16 +76,7 @@ MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
 RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
 
 
-# Fixed for the process lifetime, not per request: transformers compiles and
-# caches Jinja templates keyed by the template *source string*
-# (utils.chat_template_utils._compile_jinja_template is an lru_cache), and
-# _render_image_tokens substitutes this marker into that source. A fresh
-# marker per request made every image request a guaranteed cache miss, paying
-# a full Jinja recompile (tens of milliseconds) that a text-only request
-# never does. One marker for the process's lifetime restores the cache hit
-# without weakening the disambiguation it exists for: 128 bits of randomness
-# is unguessable whether it changes every request or stays fixed, and the
-# marker itself never leaves this function.
+# A stable marker lets repeated image requests reuse the compiled template.
 IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
 
 
