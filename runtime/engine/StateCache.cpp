@@ -156,14 +156,23 @@ bool StateCache::contains(uint64_t kvBlock) const noexcept {
   return entries_.contains(kvBlock);
 }
 
+uint64_t StateCache::resumePoint() const noexcept {
+  // Checkpoints can survive cancellation but remain disposable. Prefer an
+  // ordinary state for speculative protection, regardless of recency.
+  return ordinaryEviction_.newest ? ordinaryEviction_.newest
+                                  : checkpointEviction_.newest;
+}
+
 std::optional<CacheEvictionCandidate>
-StateCache::evictionCandidate() const noexcept {
-  const uint64_t oldest = checkpointEviction_.oldest
-                              ? checkpointEviction_.oldest
-                              : ordinaryEviction_.oldest;
-  if (!oldest)
-    return std::nullopt;
-  return CacheEvictionCandidate{oldest, entries_.at(oldest).lastUsed};
+StateCache::evictionCandidate(bool keepResumePoint) const noexcept {
+  // Withholding the resume point must not also spare the publications behind
+  // it: a speculative pass still sheds everything else it would have taken.
+  const uint64_t kept = keepResumePoint ? resumePoint() : 0;
+  for (uint64_t oldest : {checkpointEviction_.oldest, ordinaryEviction_.oldest}) {
+    if (oldest && oldest != kept)
+      return CacheEvictionCandidate{oldest, entries_.at(oldest).lastUsed};
+  }
+  return std::nullopt;
 }
 
 StateEviction StateCache::evict(uint64_t kvBlock) noexcept {

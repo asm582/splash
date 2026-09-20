@@ -737,8 +737,7 @@ bool Engine::budgetMayRecover(metal::AllocationFailure failure,
 }
 
 bool Engine::growthPaused() const {
-  return config_.memoryPressure &&
-         config_.memoryPressure() != MemoryPressure::Normal;
+  return config_.growthPaused && config_.growthPaused();
 }
 
 bool Engine::reclaimForGrowth(CacheReclaimMode mode) {
@@ -819,7 +818,8 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   const uint64_t remaining =
       released >= directive.targetBytes ? 0 : directive.targetBytes - released;
   // Even a zero-byte directive may release completely empty KV extents.
-  released += cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes);
+  released += cache_.reclaimCache(remaining, directive.evictAllUnpinnedPrefixes,
+                                 directive.keepResumePoint);
   // Evicted states park their buffers in the model's pool; a pressure pass
   // returns that memory to the host now rather than keeping it warm.
   while (model_.reclaimIdleState()) {
