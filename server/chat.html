@@ -254,6 +254,11 @@
     return messages.map(({tps, ...message}) => message);
   }
 
+  function displayContent(content) {
+    // Remove surrounding blank lines without stripping the first line's indentation.
+    return content.replace(/^(?:[ \t]*\r?\n)+|(?:\r?\n[ \t]*)+$/g, '');
+  }
+
   function assistantBox(message, live = false) {
     const box = document.createElement('div');
     box.className = 'message assistant';
@@ -264,7 +269,7 @@
     details.querySelector('.reasoning').textContent = message.reasoning_content || '';
     const content = document.createElement('div');
     content.className = 'content';
-    content.textContent = message.content || '';
+    content.textContent = displayContent(message.content || '');
     const waiting = document.createElement('div');
     waiting.className = 'waiting';
     waiting.hidden = !live || Boolean(message.content || message.reasoning_content);
@@ -477,7 +482,7 @@
     }
     if (delta.content) {
       assistant.content += delta.content;
-      box.querySelector('.content').textContent = assistant.content.trim();
+      box.querySelector('.content').textContent = displayContent(assistant.content);
     }
     scrollTo(0, document.body.scrollHeight);
     return false;
