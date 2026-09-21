@@ -47,6 +47,97 @@ void completeDecode(engine::Scheduler &scheduler, bool finished = false,
   scheduler.complete(plan, results, wallMilliseconds);
 }
 
+void testAdmissionSharesDispatchOrderAndBudget() {
+  Scheduler scheduler;
+  scheduler.submit(request(1, 8193));
+  scheduler.resourcesReady(1, 0);
+  scheduler.submit(request(2, 8193));
+  scheduler.submit(request(3, 4097));
+  scheduler.submit(request(4, 65));
+  const std::array candidates{PrefillAdmission{2, 0},
+                              PrefillAdmission{3, 4096},
+                              PrefillAdmission{4, 0}};
+  require(scheduler.prefillAdmissionOrder(candidates) ==
+              std::vector<uint64_t>({3, 4}),
+          "admission did not pack cached and short work ahead of cold work");
+  scheduler.resourcesReady(3, 4096);
+  scheduler.resourcesReady(4, 0);
+  const auto plan = *scheduler.next();
+  require(plan.items.size() == 3 && plan.items[0].requestId == 3 &&
+              plan.items[1].requestId == 4 && plan.items[2].requestId == 1 &&
+              plan.items[2].tokenCount == 1982,
+          "dispatch disagreed with admission work accounting");
+
+  Scheduler shortPrompts;
+  std::vector<PrefillAdmission> many;
+  for (uint64_t id = 1; id <= 8; ++id) {
+    shortPrompts.submit(request(id, 65));
+    many.push_back({id, 0});
+  }
+  require(shortPrompts.prefillAdmissionOrder(many) ==
+              std::vector<uint64_t>({1, 2, 3, 4}),
+          "short prefill admission lost batching or exceeded the real width");
+}
+
+void testAdmissionRespectsContendedBudgetAndDecodePriority() {
+  Scheduler scheduler;
+  scheduler.observePrefill(2048, 6144.0);
+  std::vector<PrefillAdmission> candidates;
+  for (uint64_t id = 1; id <= 4; ++id) {
+    scheduler.submit(request(id, 65));
+    candidates.push_back({id, 0});
+  }
+  require(scheduler.prefillAdmissionOrder(candidates) ==
+              std::vector<uint64_t>({1, 2}),
+          "admission ignored the contended actual-row budget");
+  scheduler.submit(request(5, 1, BatchCohort::Greedy, RequestPriority::Foreground));
+  scheduler.resourcesReady(5, 1);
+  require(scheduler.prefillAdmissionOrder(candidates).empty(),
+          "lower-priority prefill reserved cells ahead of runnable foreground decode");
+  scheduler.cancel(5);
+  require(!scheduler.prefillAdmissionOrder(candidates).empty(),
+          "prefill admission did not resume after foreground decode left");
+}
+
+void testQueuedPrefillCannotBeOvertakenIndefinitely() {
+  Scheduler scheduler;
+  scheduler.submit(request(1, 8193));
+  for (uint64_t id = 2; id <= 4; ++id) {
+    scheduler.submit(request(id, 2048));
+    const std::array candidates{PrefillAdmission{1, 0}, PrefillAdmission{id, 0}};
+    require(scheduler.prefillAdmissionOrder(candidates) == std::vector<uint64_t>{id},
+            "short work did not overtake queued long work");
+    scheduler.resourcesReady(id, 0);
+    completePrefill(scheduler, *scheduler.next());
+    scheduler.cancel(id);
+    scheduler.remove(id);
+  }
+  scheduler.submit(request(5, 65));
+  const std::array candidates{PrefillAdmission{1, 0}, PrefillAdmission{5, 0}};
+  require(scheduler.prefillAdmissionOrder(candidates) == std::vector<uint64_t>{1},
+          "queued long prefill starved behind short arrivals");
+}
+
+void testWarmupTimingSeedsFirstContendedCommand() {
+  for (double sample : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                        std::numeric_limits<double>::quiet_NaN(), 6144.0}) {
+    Scheduler scheduler;
+    scheduler.observePrefill(2048, sample);
+    scheduler.observePrefill(1, 10000.0);
+    scheduler.submit(request(1, 8193));
+    scheduler.resourcesReady(1, 0);
+    require(scheduler.next()->items[0].tokenCount == 2048,
+            "warmup shrank an uncontended prefill");
+    scheduler.submit(request(2, 1));
+    scheduler.resourcesReady(2, 1);
+    completeDecode(scheduler);
+    const auto first = *scheduler.next();
+    require(first.kind == WorkKind::Prefill &&
+                first.items[0].tokenCount == (sample == 6144.0 ? 128 : 2048),
+            "first contended prefill ignored warmup or accepted invalid timing");
+  }
+}
+
 void testShortestRemainingFirstUsesActualRows() {
   engine::Scheduler scheduler;
   scheduler.submit(request(1, 17));
@@ -270,15 +361,44 @@ void testRealDecodeWidths() {
   }
 }
 
-void testNoCrossCohortBatch() {
-  engine::Scheduler scheduler;
-  scheduler.submit(request(1, 1, BatchCohort::Greedy));
-  scheduler.submit(request(2, 1, BatchCohort::Sampling));
+void testMixedSamplingBatch() {
+  for (uint32_t mask = 0; mask < 16; ++mask) {
+    Scheduler scheduler;
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+      const auto cohort = (mask & (1U << lane)) ? BatchCohort::Sampling
+                                              : BatchCohort::Greedy;
+      scheduler.submit(request(lane + 1, 1, cohort));
+      scheduler.resourcesReady(lane + 1, 1);
+    }
+    const BatchPlan plan = *scheduler.next();
+    require(plan.width() == 4 && plan.cohort ==
+                (mask ? BatchCohort::Sampling : BatchCohort::Greedy),
+            "compatible greedy and sampling requests were split");
+  }
+}
+
+void testConstrainedDecodeRemainsSeparate() {
+  Scheduler scheduler;
+  scheduler.submit(request(1, 1, BatchCohort::Constrained));
   scheduler.resourcesReady(1, 1);
+  const BatchPlan initial = *scheduler.next();
+  scheduler.commit(initial);
+  const std::array mask{StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
+  scheduler.complete(initial, mask);
+  scheduler.maskReady(1);
+  completeDecode(scheduler);
+  scheduler.submit(request(2, 1, BatchCohort::Greedy));
+  scheduler.submit(request(3, 1, BatchCohort::Sampling));
   scheduler.resourcesReady(2, 1);
-  BatchPlan plan = *scheduler.next();
-  require(plan.width() == 1,
-          "decode mixed incompatible consumer policies in one graph");
+  scheduler.resourcesReady(3, 1);
+  const BatchPlan mixed = *scheduler.next();
+  require(mixed.width() == 2 && mixed.cohort == BatchCohort::Sampling,
+          "mixed decode included a constrained lane");
+  completeDecode(scheduler);
+  const BatchPlan constrained = *scheduler.next();
+  require(constrained.width() == 1 && constrained.items[0].requestId == 1 &&
+              constrained.cohort == BatchCohort::Constrained,
+          "constrained decode lost its independent mask pipeline");
 }
 
 void testPrefillAndDecodeAlternateWithoutStarvation() {
@@ -589,25 +709,10 @@ void testDecodeCohortsAndLanesRotate() {
   scheduler.complete(first, firstResults);
 
   BatchPlan second = *scheduler.next();
-  require(second.kind == WorkKind::Decode &&
-              std::any_of(second.items.begin(), second.items.end(),
-                          [](const BatchItem &item) {
-                            return item.requestId == 5;
-                          }),
-          "an unscheduled lane was starved by the previous B4 members");
-  scheduler.commit(second);
-  std::vector<StepResult> secondResults;
-  for (const BatchItem &item : second.items) {
-    secondResults.push_back(
-        {item.requestId, 0, false, DecodeStage::Regular});
-  }
-  scheduler.complete(second, secondResults);
-
-  BatchPlan third = *scheduler.next();
-  require(third.kind == WorkKind::Decode && third.width() == 1 &&
-              third.items[0].requestId == 6 &&
-              third.cohort == BatchCohort::Sampling,
-          "a different decode cohort was starved by a continuous leader");
+  require(second.kind == WorkKind::Decode && second.width() == 4 &&
+              second.cohort == BatchCohort::Sampling &&
+              second.items[0].requestId == 5 && second.items[1].requestId == 6,
+          "mixed decode did not prioritize lanes omitted by the previous batch");
 }
 
 void testMaskStagesNeverMix() {
@@ -687,6 +792,43 @@ void testWaitingMaskExpiresAtRequestDeadline() {
   require(rejectedLateMask, "late mask revived an expired request");
 }
 
+void testWaitingMaskBoundsPeerPrefill() {
+  for (const RequestPriority priority : {RequestPriority::Foreground,
+                                         RequestPriority::Normal,
+                                         RequestPriority::Background}) {
+    Scheduler scheduler;
+    scheduler.observePrefill(2048, 4096.0);
+    scheduler.submit(request(1, 1, BatchCohort::Constrained, priority));
+    scheduler.resourcesReady(1, 1);
+    const BatchPlan initial = *scheduler.next();
+    scheduler.commit(initial);
+    const std::array result{
+        StepResult{1, 0, false, DecodeStage::ApplyInitialMask}};
+    scheduler.complete(initial, result);
+
+    scheduler.submit(request(2, 20'000));
+    scheduler.resourcesReady(2, 0);
+    const BatchPlan prefill = *scheduler.next();
+    const bool protectedPeer = priority <= RequestPriority::Normal;
+    require(prefill.kind == WorkKind::Prefill &&
+                prefill.items[0].requestId == 2 &&
+                prefill.items[0].tokenCount == (protectedPeer ? 128u : 2048u),
+            "mask wait lost prefill latency protection or priority ordering");
+    // A mask arriving during the command must get the next decode turn.
+    scheduler.maskReady(1);
+    completePrefill(scheduler, prefill);
+    if (protectedPeer) {
+      const BatchPlan decode = *scheduler.next();
+      require(decode.kind == WorkKind::Decode &&
+                  decode.items[0].requestId == 1,
+              "ready mask did not resume after bounded prefill");
+    }
+    scheduler.cancel(1);
+    require(scheduler.next()->items[0].tokenCount == 2048,
+            "cancelled mask request kept isolated prefill throttled");
+  }
+}
+
 void testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage() {
   engine::Scheduler scheduler;
   scheduler.submit(request(1, 4096));
@@ -729,6 +871,10 @@ void testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage() {
 
 int main() {
   try {
+    testAdmissionSharesDispatchOrderAndBudget();
+    testAdmissionRespectsContendedBudgetAndDecodePriority();
+    testQueuedPrefillCannotBeOvertakenIndefinitely();
+    testWarmupTimingSeedsFirstContendedCommand();
     testShortestRemainingFirstUsesActualRows();
     testPerRequestBoundary();
     testEqualPromptsFinishInArrivalOrder();
@@ -738,7 +884,8 @@ int main() {
     testLaneOvertakenThreeTimesLeadsTheNextCommand();
     testServedLaneResetsOvertaking();
     testRealDecodeWidths();
-    testNoCrossCohortBatch();
+    testMixedSamplingBatch();
+    testConstrainedDecodeRemainsSeparate();
     testPrefillAndDecodeAlternateWithoutStarvation();
     testMeasuredBudgetOnlyLimitsContendedWork();
     testAuxiliaryWorkDoesNotTrainTextPrefillTiming();
@@ -756,6 +903,7 @@ int main() {
     testDecodeCohortsAndLanesRotate();
     testMaskStagesNeverMix();
     testWaitingMaskExpiresAtRequestDeadline();
+    testWaitingMaskBoundsPeerPrefill();
     testResourceSuspensionReplaysFromCacheAndPreservesDecodeStage();
     std::cout << "ragged scheduler tests passed\n";
     return EXIT_SUCCESS;

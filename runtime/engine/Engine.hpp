@@ -73,6 +73,9 @@ public:
          EngineEventSink &events);
 
   void submit(EngineRequest request);
+  void observePrefill(uint32_t rows, double wallMilliseconds) {
+    scheduler_.observePrefill(rows, wallMilliseconds);
+  }
   void cancel(uint64_t requestId);
   void failRequest(uint64_t requestId, std::string code, std::string message);
   void provideMask(uint64_t requestId, std::span<const uint32_t> words);
@@ -139,7 +142,10 @@ private:
     bool finalized = false;
     std::optional<Failure> failure;
     bool replaying = false;
+    // Captured once the final prompt chunk completes; emitted with Done.
+    std::vector<float> scoreLogits;
   };
+
 
   struct Pending final {
     BatchPlan plan;
@@ -150,9 +156,16 @@ private:
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
+  [[nodiscard]] static uint32_t sharedPrefillBoundary(const Request &left,
+                                                      const Request &right);
+  [[nodiscard]] bool pendingSharedPrefill(const Request &request,
+                                          uint32_t resumeBoundary) const;
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
                           uint32_t junctionBoundary);
+  [[nodiscard]] bool addSharedPrefillBoundaries(Request &request, uint32_t after);
+  [[nodiscard]] DraftContextPlan
+  pendingDraftStatePlan(const Request &request, uint32_t stateBoundary) const;
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
   [[nodiscard]] bool retireCheckpoint(Request &request);
@@ -182,7 +195,8 @@ private:
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
              double wallMilliseconds, bool representativePrefillTiming);
-  void finish(Request &request, EngineFinishReason reason);
+  void finish(Request &request, EngineFinishReason reason,
+              std::span<const float> optionLogits);
   void finishFailure(Request &request, Failure failure);
   void finishCapacity(Request &request, const TokenAdmission &admission);
   void release(Request &request);

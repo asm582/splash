@@ -359,7 +359,7 @@ public:
         requestId, std::vector<uint32_t>(simulation.begin(), simulation.end()));
   }
   void completed(uint64_t id, EngineFinishReason, uint32_t prompt,
-                 uint32_t completion) override {
+                 uint32_t completion, std::span<const float>) override {
     ++completedCount;
     usage[id] = {prompt, completion};
   }
@@ -406,6 +406,263 @@ void runUntilIdle(engine::Engine &engine) {
     static_cast<void>(engine.tick(step + 1));
   }
   require(engine.idle(), "engine did not reach idle");
+}
+
+void testConcurrentColdPrefixesComputeOnce() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  for (uint32_t id = 1; id <= 4; ++id) {
+    std::vector<uint32_t> prompt(193, 7);
+    std::fill(prompt.begin() + 160, prompt.end(), id + 10);
+    engine.submit(request(id, prompt));
+  }
+  static_cast<void>(engine.tick(0));
+  require(model.requests.size() == 1,
+          "shared cold prefix allocated redundant active state cells");
+  runUntilIdle(engine);
+  require(model.prefillRows == 160 + 4 * 33 && model.restored == 3 * 160,
+          "concurrent cold requests recomputed their shared prefix");
+  require(events.completedCount == 4 && events.failedCount == 0 &&
+              events.emitted == 4,
+          "shared prefill lost independent completions");
+}
+
+void testSharedPrefillRebuildsTheMissingJunctionOnce() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  engine.submit(request(1, std::vector<uint32_t>(6530, 7)));
+  runUntilIdle(engine);
+  std::vector<uint32_t> branch(6575, 7);
+  std::fill(branch.begin() + 6517, branch.end(), 8);
+  {
+    auto hit = cache.lookup(branch);
+    require(hit.kvBoundary == 6496 && hit.resumeBoundary() == 0,
+            "fixture did not recreate a KV-only internal branch");
+  }
+  const uint32_t before = model.prefillRows;
+  for (uint32_t id = 2; id <= 5; ++id) {
+    std::fill(branch.begin() + 6517, branch.end(), id + 10);
+    engine.submit(request(id, branch));
+  }
+  runUntilIdle(engine);
+  require(model.prefillRows - before == 6496 + 4 * (6575 - 6496) &&
+              model.restored == 3 * 6496 && events.completedCount == 5,
+          "concurrent internal branches each rebuilt the missing GDN state");
+}
+
+void testSharedPrefillReleasesDifferentJunctionsIndependently() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  engine.submit(request(1, std::vector<uint32_t>(193, 7)));
+  for (uint32_t id = 2; id <= 3; ++id) {
+    std::vector<uint32_t> branch(193, 7);
+    std::fill(branch.begin() + (id == 2 ? 96 : 160), branch.end(), id + 10);
+    engine.submit(request(id, branch));
+  }
+  static_cast<void>(engine.tick(0));
+  static_cast<void>(engine.tick(1));
+  static_cast<void>(engine.tick(2));
+  require(model.requests.size() == 2 && events.startIds.back() == 2,
+          "a ready junction waited for the producer's longer shared prefix");
+  runUntilIdle(engine);
+  require(model.prefillRows == 193 + 97 + 33 && events.completedCount == 3,
+          "different shared boundaries were not restored independently");
+}
+
+void testSharedPrefillEvictedPublicationFallsBack() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  engine.submit(request(1, std::vector<uint32_t>(193, 7)));
+  engine.submit(request(2, std::vector<uint32_t>(193, 7)));
+  static_cast<void>(engine.tick(0));
+  static_cast<void>(engine.tick(1));
+  require(cache.reclaimOneState(),
+          "published shared prefix was pinned against pressure reclamation");
+  runUntilIdle(engine);
+  require(events.completedCount == 2 && model.prefillRows == 386 &&
+              cache.snapshot().activeRequests == 0,
+          "evicted shared publication stranded its waiter");
+}
+
+void testSharedPrefillProducerFailureReleasesWaiters() {
+  for (bool cancelled : {false, true}) {
+    Backing backing(64);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor model;
+    Events events;
+    engine::Engine engine({}, cache, model, events);
+    engine.submit(request(1, std::vector<uint32_t>(193, 7)));
+    engine.submit(request(2, std::vector<uint32_t>(193, 7)));
+    static_cast<void>(engine.tick(0));
+    require(engine.snapshot().scheduler.waitingPrefix == 1 &&
+                engine.resourceWaitSnapshot(0).memory == 0 &&
+                model.requests.size() == 1,
+            "shared prefill waiter was admitted before its prefix was ready");
+    if (cancelled)
+      engine.cancel(1);
+    else
+      engine.failRequest(1, "test_failure", "producer failed");
+    runUntilIdle(engine);
+    require(events.outputs[2] == std::vector<uint32_t>{42} &&
+                cache.snapshot().activeRequests == 0 && model.requests.empty(),
+            "failed prefix producer stranded a waiter or leaked resources");
+  }
+}
+
+void testSharedPrefillWaiterCancellationAndDeadline() {
+  for (bool cancelled : {false, true}) {
+    Backing backing(64);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor model;
+    Events events;
+    engine::Engine engine({}, cache, model, events);
+    engine.submit(request(1, std::vector<uint32_t>(193, 7)));
+    auto waiter = request(2, std::vector<uint32_t>(193, 7));
+    waiter.deadlineMilliseconds = 1;
+    engine.submit(std::move(waiter));
+    static_cast<void>(engine.tick(0));
+    if (cancelled)
+      engine.cancel(2);
+    runUntilIdle(engine);
+    require(model.beginAttempts == 1 && events.outputs[2].empty() &&
+                events.outputs[1] == std::vector<uint32_t>{42} &&
+                engine.snapshot().scheduler.waitingPrefix == 0,
+            "expired prefix waiter allocated a cell or interrupted its producer");
+  }
+}
+
+void testSharedPrefillFailedPublicationFallsBack() {
+  Backing backing(64);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor model;
+  model.deniedSnapshots = 100;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  for (uint32_t id = 1; id <= 4; ++id)
+    engine.submit(request(id, std::vector<uint32_t>(193, 7)));
+  runUntilIdle(engine);
+  require(events.completedCount == 4 && events.failedCount == 0 &&
+              model.prefillRows == 4 * 193 && cache.snapshot().activeRequests == 0,
+          "a missing prefix snapshot stranded dependent requests");
+}
+
+void testSharedPrefillDoesNotBlockUnrelatedWork() {
+  for (bool images : {false, true}) {
+    Backing backing(64);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor model;
+    Events events;
+    engine::Engine engine({}, cache, model, events);
+    for (uint32_t id = 1; id <= 4; ++id) {
+      auto value = request(id, std::vector<uint32_t>(193, images ? 7 : id));
+      if (images) {
+        value.images = {{0, 16, 8, 8, id, id}};
+        value.imagePixels.assign(value.images.front().pixelBytes(), 1);
+      }
+      engine.submit(std::move(value));
+    }
+    static_cast<void>(engine.tick(0));
+    require(model.requests.size() == 4 &&
+                engine.snapshot().scheduler.waitingPrefix == 0,
+            "unrelated token or image prefixes were serialized");
+    runUntilIdle(engine);
+    require(model.prefillRows == 4 * 193 && events.completedCount == 4,
+            "unrelated work incorrectly reused a shared state");
+  }
+}
+
+void testSharedPrefillHonorsPriorityAndLateArrival() {
+  for (bool foreground : {false, true}) {
+    Backing backing(512);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor model;
+    Events events;
+    engine::Engine engine({}, cache, model, events);
+    auto producer = request(1, std::vector<uint32_t>(5001, 7));
+    producer.priority = RequestPriority::Background;
+    engine.submit(std::move(producer));
+    static_cast<void>(engine.tick(0));
+    auto waiter = request(2, std::vector<uint32_t>(5001, 7));
+    waiter.priority = foreground ? RequestPriority::Foreground
+                                : RequestPriority::Background;
+    engine.submit(std::move(waiter));
+    static_cast<void>(engine.tick(1));
+    static_cast<void>(engine.tick(2));
+    require(model.requests.size() == (foreground ? 2u : 1u),
+            "prefix admission ignored priority or a late arrival");
+    runUntilIdle(engine);
+    require(events.completedCount == 2 && events.failedCount == 0,
+            "late prefix waiter did not finish");
+    if (!foreground)
+      require(model.prefillRows == 5010 && model.restored == 4992,
+              "late arrival missed the producer's planned replay point");
+  }
+}
+
+void testLateSharedPrefillExtendsTheProducerPlan() {
+  for (bool denyCheckpoint : {false, true}) {
+    Backing backing(512);
+    KvPool pool(backing);
+    engine::Cache cache(pool, CacheNamespace{});
+    Executor model;
+    if (denyCheckpoint)
+      model.denySnapshotAtBoundary = 4096;
+    Events events;
+    engine::Engine engine({}, cache, model, events);
+    engine.submit(request(1, std::vector<uint32_t>(6601, 7)));
+    static_cast<void>(engine.tick(0));
+    for (uint32_t id = 2; id <= 4; ++id) {
+      std::vector<uint32_t> branch(6601, 7);
+      std::fill(branch.begin() + 6500, branch.end(), id + 10);
+      engine.submit(request(id, branch));
+    }
+    runUntilIdle(engine);
+    require(events.completedCount == 4 && events.failedCount == 0 &&
+                model.prefillRows == 6601 + 3 * (6601 - 6496) &&
+                model.restored == 3 * 6496,
+            "late siblings recomputed the prefix after the producer's checkpoint");
+  }
+}
+
+void testSharedPrefillCapacityFailureDoesNotDeadlock() {
+  Backing backing(4);
+  KvPool pool(backing);
+  engine::Cache cache(pool, CacheNamespace{});
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  for (uint32_t id = 1; id <= 4; ++id)
+    engine.submit(request(id, std::vector<uint32_t>(193, 7)));
+  for (uint32_t step = 0; step < 64 && !engine.idle(); ++step)
+    static_cast<void>(engine.tick(step * 1000));
+  require(engine.idle() && cache.snapshot().activeRequests == 0 &&
+              model.requests.empty() && events.emitted == 0,
+          "capacity failure stranded a shared prefix producer or waiter");
+  engine.submit(request(5, std::vector<uint32_t>(33, 9)));
+  runUntilIdle(engine);
+  require(events.outputs[5] == std::vector<uint32_t>{42},
+          "capacity failure prevented subsequent service");
 }
 
 void testColdPublishesReplayStateAndLazyJunctionCanRebuildIt() {
@@ -471,15 +728,14 @@ void testConcurrentDuplicateStateSkipsSnapshotCapture() {
   engine.submit(request(102, prompt));
   runUntilIdle(engine);
 
-  // Both lanes arm the same boundary without reserving anything; the second
-  // to reach it finds the first lane's state resident and never snapshots.
+  // The second request restores the first publication without reserving a
+  // redundant state cell or capturing the same state again.
   const auto snapshot = engine.snapshot();
   require(executor.snapshotAttempts == 1 && executor.snapshots == 1,
           "duplicate state publication performed a second snapshot capture");
   require(snapshot.resources.stateCache.entries == 1 &&
               snapshot.resources.stateCache.publications == 1 &&
-              snapshot.resources.stateCache.deduplicatedPublications == 1 &&
-              snapshot.deduplicatedStatePublications == 1 &&
+              snapshot.cacheHits == 1 && executor.prefillRows == 66 &&
               snapshot.replayStatePublications == 1 &&
               snapshot.replayStatePublicationFailures == 0,
           "duplicate state publication was not reused and accounted");
@@ -1437,6 +1693,113 @@ void testSingletonCapacityFailureTerminatesCleanly() {
           "B1 capacity failure leaked backend resources");
 }
 
+void testQueuedLongPrefillsLeaveRoomForShortWork() {
+  Backing backing(2048);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  for (uint64_t id = 1; id <= 4; ++id)
+    engine.submit(request(id, std::vector<uint32_t>(8193, id)));
+  require(engine.tick(1) && engine.tick(2) &&
+              executor.requests.size() == 1 && executor.prefillRows == 2048,
+          "long prefills reserved cells without executable work");
+  engine.submit(request(5, std::vector<uint32_t>(65, 5)));
+  require(engine.tick(3) && executor.requests.contains(5) &&
+              executor.requests.at(5).position > 0 && events.completedCount == 0,
+          "short arrival waited for a long prefill to finish");
+  for (uint32_t now = 4; now < 200 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && events.completedCount == 5 &&
+              events.failedCount == 0 && events.capacityExhaustedCount == 0 &&
+              executor.prefillRows == 4 * 8193 + 65 && executor.suspensions == 0,
+          "admission lost work, introduced replay, or stranded queued requests");
+}
+
+void testAdmissionUsesCachedRemainingWork() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  const std::vector<uint32_t> warm(4097, 47);
+  engine.submit(request(1, warm));
+  runUntilIdle(engine);
+  engine.submit(request(2, std::vector<uint32_t>(8193, 48)));
+  require(engine.tick(1) && engine.tick(2), "cold prefill did not start");
+  engine.submit(request(3, warm));
+  require(engine.tick(3) && executor.requests.contains(3) &&
+              executor.restored == 4096 && executor.requests.at(3).position == 4097,
+          "cached prompt was scheduled by total length instead of remaining work");
+  runUntilIdle(engine);
+  require(events.completedCount == 3 && events.failedCount == 0,
+          "cache-aware admission failed to finish");
+}
+
+void testFailedAdmissionDoesNotBlockOtherWork() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 1; };
+  engine.submit(request(1, std::vector<uint32_t>(4097, 47)));
+  engine.submit(request(2, std::vector<uint32_t>(8193, 48)));
+  require(engine.tick(1) && executor.requests.contains(2),
+          "failed prefill admission blocked a runnable peer");
+  runUntilIdle(engine);
+  require(events.completedCount == 2 && events.failedCount == 0,
+          "failed admission did not recover");
+}
+
+void testSchedulingWaitDoesNotConsumeMemoryTimeout() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({.resourceWaitTimeoutMilliseconds = 1000.0},
+                        resources, executor, events);
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 1; };
+  engine.submit(request(1, std::vector<uint32_t>(8193, 47)));
+  static_cast<void>(engine.tick(1));
+  auto urgent = request(2, std::vector<uint32_t>(4097, 48));
+  urgent.priority = RequestPriority::Foreground;
+  engine.submit(std::move(urgent));
+  require(engine.tick(102) && engine.resourceWaitSnapshot(102).memory == 0,
+          "scheduler delay retained a stale memory wait");
+  for (uint32_t now = 1100; now < 1200 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() && events.completedCount == 2 && events.failedCount == 0,
+          "scheduling delay triggered the memory wait timeout");
+}
+
+void testUnadmittedRequestsHonorCancellationAndDeadline() {
+  Backing backing(1024);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor;
+  Events events;
+  engine::Engine engine({}, resources, executor, events);
+  engine.submit(request(1, std::vector<uint32_t>(8193, 1)));
+  engine.submit(request(2, std::vector<uint32_t>(8193, 2)));
+  auto expiring = request(3, std::vector<uint32_t>(8193, 3));
+  expiring.deadlineMilliseconds = 3;
+  engine.submit(std::move(expiring));
+  require(engine.tick(1) && engine.tick(2), "long prefill did not start");
+  engine.cancel(2);
+  static_cast<void>(engine.tick(3));
+  runUntilIdle(engine);
+  require(engine.snapshot().cancelled == 1 && events.failedCount == 1 &&
+              events.completedCount == 2 && executor.beginAttempts == 1,
+          "queued cancellation or deadline allocated resources or failed cleanup");
+}
+
 void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
   for (RequestPriority priority : {RequestPriority::Normal,
                                    RequestPriority::Background}) {
@@ -1459,16 +1822,23 @@ void testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield() {
     engine.submit(std::move(peer));
     require(engine.tick(1) && engine.tick(2) &&
                 executor.requests.at(48).position == 2048 &&
-                executor.requests.at(49).position == 0,
-            "growth fixture did not isolate a started and an unstarted prefill");
-    require(engine.tick(3) && executor.suspensions == 1 &&
-                executor.requests.at(48).resident &&
-                !executor.requests.at(49).resident,
-            "KV growth discarded completed prefill instead of its unstarted peer");
+                !executor.requests.contains(49),
+            "unstarted prefill reserved a cell before it had scheduled work");
+    require(engine.tick(3) && executor.requests.at(48).resident,
+            "KV growth discarded completed prefill");
+    if (priority == RequestPriority::Normal) {
+      // The final prefill slice admits a peer into its remaining row budget;
+      // if that cell prevents KV growth, the unstarted peer must yield.
+      require(executor.suspensions == 1 && !executor.requests.at(49).resident,
+              "KV growth did not yield the unstarted peer");
+    } else {
+      require(executor.suspensions == 0 && !executor.requests.contains(49),
+              "lower-priority work reserved a cell before its dispatch");
+    }
     runUntilIdle(engine);
     require(events.completedCount == 2 && events.failedCount == 0 &&
                 events.capacityExhaustedCount == 0 && executor.prefillRows == 12288,
-            "yielding an unstarted peer lost work or failed to resume");
+            "work-aware admission lost prefill work or failed to complete");
   }
 }
 
@@ -2488,7 +2858,8 @@ void testConcurrentProgressRetainsAtMostOnePointPerLane() {
   require(engine.idle() && events.completedCount == 2 &&
               engine.snapshot().checkpointPublications >= checkpoints &&
               engine.snapshot().checkpointPublications <= 2 * checkpoints &&
-              engine.snapshot().deduplicatedStatePublications >= 1 &&
+              engine.snapshot().cacheHits == 1 &&
+              executor.prefillRows == prompt.size() * 2 - 24992 &&
               maximumEntries <= 2 &&
               resources.snapshot().stateCache.entries == 1,
           "concurrent prompts accumulated progress states beyond their active lanes");
@@ -2938,6 +3309,17 @@ void testCheckpointIntervalValidationAndDisable() {
 
 int main() {
   try {
+    testConcurrentColdPrefixesComputeOnce();
+    testSharedPrefillRebuildsTheMissingJunctionOnce();
+    testSharedPrefillReleasesDifferentJunctionsIndependently();
+    testSharedPrefillEvictedPublicationFallsBack();
+    testSharedPrefillProducerFailureReleasesWaiters();
+    testSharedPrefillWaiterCancellationAndDeadline();
+    testSharedPrefillFailedPublicationFallsBack();
+    testSharedPrefillDoesNotBlockUnrelatedWork();
+    testSharedPrefillHonorsPriorityAndLateArrival();
+    testLateSharedPrefillExtendsTheProducerPlan();
+    testSharedPrefillCapacityFailureDoesNotDeadlock();
     testCancelledColdPrefillResumesItsLatestCheckpoint();
     testConcurrentProgressRetainsAtMostOnePointPerLane();
     testSharedCheckpointSurvivesPeerRollingReplacement();
@@ -2982,6 +3364,11 @@ int main() {
     testAdmissionPinsDesiredStateAndCountsOnlySuccess();
     testAdmissionCanDropItsOwnCachePinToMakeProgress();
     testSingletonCapacityFailureTerminatesCleanly();
+    testQueuedLongPrefillsLeaveRoomForShortWork();
+    testAdmissionUsesCachedRemainingWork();
+    testFailedAdmissionDoesNotBlockOtherWork();
+    testSchedulingWaitDoesNotConsumeMemoryTimeout();
+    testUnadmittedRequestsHonorCancellationAndDeadline();
     testGrowthKeepsPrefillProgressWhenAnUnstartedPeerCanYield();
     testGrowthYieldsLowerPriorityResidentOutsideBatch();
     testPrefillGrowthPreservesAnActiveDecodePeer();

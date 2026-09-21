@@ -16,6 +16,7 @@ from jinja2 import TemplateError
 
 if __package__:
     from . import images as image_input
+    from . import json_codec, judgments
     from . import protocol as wire
     from .api_shapes import (
         IMAGE_PAD_TOKEN,
@@ -27,6 +28,7 @@ if __package__:
     from .backend import REQUEST_PRIORITIES, Job, remaining_request_time
     from .diagnostics import print_status
     from .errors import APIError, ContextLengthError
+    from .latency import LatencyMetrics
     from .metrics import is_finite_number
     from .thinking import ThinkingCodec
     from .tool_schema import (
@@ -39,6 +41,8 @@ if __package__:
     )
 else:
     import images as image_input
+    import json_codec
+    import judgments
     import protocol as wire
     from api_shapes import (
         IMAGE_PAD_TOKEN,
@@ -50,6 +54,7 @@ else:
     from backend import REQUEST_PRIORITIES, Job, remaining_request_time
     from diagnostics import print_status
     from errors import APIError, ContextLengthError
+    from latency import LatencyMetrics
     from metrics import is_finite_number
     from thinking import ThinkingCodec
     from tool_schema import (
@@ -72,6 +77,10 @@ MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
 RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
 
 
+# A stable marker lets repeated image requests reuse the compiled template.
+IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
+
+
 def _thinking_from_prefix(rendered):
     marker = "<|im_start|>"
     start = rendered.rfind(marker)
@@ -86,8 +95,16 @@ def _thinking_from_prefix(rendered):
 
 @dataclass(frozen=True, slots=True)
 class StoredResponse:
-    response: dict
-    history_items: list
+    response_json: bytes
+    history_json: bytes
+
+    @property
+    def size(self):
+        return len(self.response_json) + len(self.history_json)
+
+    @property
+    def response(self):
+        return json_codec.loads(self.response_json)
 
 
 class ResponseStore:
@@ -116,31 +133,24 @@ class ResponseStore:
                 return None
             self.records[response_id] = record
             self.hits += 1
-        payload, _ = record
-        decoded = json.loads(payload)
-        return StoredResponse(decoded["response"], decoded["history"])
+        return record
 
     def put(self, response, history_items):
-        payload = json.dumps(
-            {"response": response, "history": history_items},
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-        ).encode()
-        size = len(payload)
-        if size > self.budget_bytes:
+        record = StoredResponse(
+            json_codec.encode(response), json_codec.encode(history_items)
+        )
+        if record.size > self.budget_bytes:
             return False
         response_id = response["id"]
-        record = (payload, size)
         with self.lock:
             previous = self.records.pop(response_id, None)
             if previous is not None:
-                self.bytes -= previous[1]
+                self.bytes -= previous.size
             self.records[response_id] = record
-            self.bytes += size
+            self.bytes += record.size
             while self.bytes > self.budget_bytes:
                 _, evicted = self.records.popitem(last=False)
-                self.bytes -= evicted[1]
+                self.bytes -= evicted.size
                 self.evictions += 1
         return True
 
@@ -149,7 +159,7 @@ class ResponseStore:
             record = self.records.pop(response_id, None)
             if record is None:
                 return False
-            self.bytes -= record[1]
+            self.bytes -= record.size
             return True
 
     def stats(self):
@@ -200,6 +210,7 @@ class Frontend:
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
+        self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
         self.backend = backend
         self.model = model
@@ -232,6 +243,7 @@ class Frontend:
             status["grammar_cache"] = self.constraint_factory.stats()
         status["response_store"] = self.response_store.stats()
         status["image_cache"] = self.images.stats()
+        status["latency"] = self.latencies.snapshot()
         return status
 
     def _prepare_images(self, messages, *, check_context=True):
@@ -280,7 +292,7 @@ class Frontend:
     ):
         if check_context and tokens >= self.max_context:
             raise ContextLengthError(
-                tokens, self.max_context, image_tokens_only=image_tokens_only
+                tokens, self.max_context - 1, image_tokens_only=image_tokens_only
             )
         frame_bytes = (
             wire.REQUEST_FIXED_BYTES
@@ -300,16 +312,15 @@ class Frontend:
         documentation or source containing literal vision tokens.
         """
         source = self.tokenizer.get_chat_template(tools=template.get("tools"))
-        marker = f"__splash_image_{secrets.token_hex(16)}__"
         rendered = self._apply_chat_template(
             messages,
             {
                 **template,
                 "tokenize": False,
-                "chat_template": source.replace(IMAGE_PAD_TOKEN, marker),
+                "chat_template": source.replace(IMAGE_PAD_TOKEN, IMAGE_RENDER_MARKER),
             },
         )
-        parts = rendered.split(marker)
+        parts = rendered.split(IMAGE_RENDER_MARKER)
         image_offsets = set()
         offset = 0
         for part in parts[:-1]:
@@ -317,7 +328,7 @@ class Frontend:
             image_offsets.add((offset, offset + len(IMAGE_PAD_TOKEN)))
             offset += len(IMAGE_PAD_TOKEN)
         rendered = IMAGE_PAD_TOKEN.join(parts)
-        encoded = self.tokenizer(
+        encoded = self._tokenize(
             rendered,
             add_special_tokens=False,
             return_offsets_mapping=True,
@@ -412,13 +423,184 @@ class Frontend:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
             try:
-                tokens = self.tokenizer(content, add_special_tokens=add_special)[
+                tokens = self._tokenize(content, add_special_tokens=add_special)[
                     "input_ids"
                 ]
             except Exception as error:
                 raise APIError(400, "content could not be tokenized") from error
             remaining_request_time(deadline)
             return tokens
+
+    def _priority(self, body):
+        priority_name = body.get("priority", "normal")
+        if (
+            not isinstance(priority_name, str)
+            or priority_name not in REQUEST_PRIORITIES
+        ):
+            raise APIError(400, "priority must be foreground, normal, or background")
+        return REQUEST_PRIORITIES[priority_name]
+
+    def _score_job(self, prompt_tokens, slot_ids, deadline, priority, meta):
+        return Job(
+            request_id=next(self.ids),
+            prompt_tokens=prompt_tokens,
+            max_new_tokens=0,
+            seed=0,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            deadline=deadline,
+            priority=priority,
+            score_tokens=tuple(slot_ids),
+            public_id=secrets.token_hex(16),
+            meta=meta,
+        )
+
+    def prepare_judgment(self, body, *, deadline=None):
+        unknown = sorted(
+            set(body)
+            - {"id", "state", "question", "options", "model", "timeout", "priority"}
+        )
+        if unknown:
+            raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
+        if body.get("model", self.model) != self.model:
+            raise APIError(404, f"model {body['model']} not found", "model_not_found")
+        try:
+            judgments.validate_row(body)
+        except ValueError as error:
+            raise APIError(400, str(error)) from error
+        if deadline is None:
+            deadline = self.request_deadline(body)
+        priority = self._priority(body)
+        with self._preparation(deadline):
+
+            def admit(prompt_tokens):
+                remaining_request_time(deadline)
+                if prompt_tokens > self.max_context:
+                    raise ContextLengthError(prompt_tokens, self.max_context)
+
+            try:
+                tokens, slots, prompt = judgments.encode_prompt(
+                    self.tokenizer,
+                    judgments.judgment_messages(body),
+                    judgments.LETTERS[: len(body["options"])],
+                    admit=admit,
+                    checkpoint=lambda: remaining_request_time(deadline),
+                )
+            except judgments.ScoringUnsupported as error:
+                raise APIError(500, str(error), "scoring_unsupported") from error
+            except APIError:
+                raise
+            except Exception as error:
+                raise APIError(400, "judgment prompt could not be rendered") from error
+            remaining_request_time(deadline)
+            job = self._score_job(
+                tokens,
+                slots,
+                deadline,
+                priority,
+                {
+                    "prompt_sha256": judgments.digest(prompt),
+                    "answer_token_ids": tuple(slots),
+                },
+            )
+        return job, body
+
+    def prepare_systemone(self, body, *, deadline=None):
+        details = []
+        model = body.get("model")
+        if not isinstance(model, str) or not model:
+            details.append(judgments.detail(["model"], "field required", "missing"))
+        elif model != self.model:
+            details.append(
+                judgments.detail(
+                    ["model"], f"model {model} is not served by this endpoint"
+                )
+            )
+        state, specs, question_details = judgments.validate_systemone(body)
+        details.extend(question_details)
+        priority_name = body.get("priority", "normal")
+        if (
+            not isinstance(priority_name, str)
+            or priority_name not in REQUEST_PRIORITIES
+        ):
+            details.append(
+                judgments.detail(
+                    ["priority"],
+                    "priority must be foreground, normal, or background",
+                )
+            )
+        if details:
+            raise judgments.SystemOneError(details)
+        if deadline is None:
+            deadline = self.request_deadline(body)
+        priority = REQUEST_PRIORITIES[priority_name]
+        jobs = []
+        total_tokens = 0
+        with self._preparation(deadline):
+            for qid, spec in specs:
+                if spec.deterministic:
+                    jobs.append((qid, spec, None))
+                    continue
+                slots = judgments.slot_labels(self.tokenizer)
+                if len(spec.labels) > len(slots):
+                    raise judgments.SystemOneError(
+                        [
+                            judgments.detail(
+                                ["questions", qid, "criteria"],
+                                f"the served tokenizer supports "
+                                f"{len(slots)} answer slots; "
+                                f"{len(spec.labels)} were requested",
+                            )
+                        ]
+                    )
+                labels = slots[: len(spec.labels)]
+
+                def admit(prompt_tokens, qid=qid, prepared=total_tokens):
+                    remaining_request_time(deadline)
+                    if prompt_tokens > self.max_context:
+                        raise ContextLengthError(prompt_tokens, self.max_context)
+                    if prepared + prompt_tokens > judgments.MAX_SYSTEMONE_TOTAL_TOKENS:
+                        raise judgments.SystemOneError(
+                            [
+                                judgments.detail(
+                                    ["questions", qid],
+                                    "total prepared question tokens exceed "
+                                    f"{judgments.MAX_SYSTEMONE_TOTAL_TOKENS}",
+                                )
+                            ]
+                        )
+
+                try:
+                    tokens, slot_ids, prompt = judgments.encode_prompt(
+                        self.tokenizer,
+                        judgments.systemone_messages(state, spec, labels),
+                        labels,
+                        admit=admit,
+                        checkpoint=lambda: remaining_request_time(deadline),
+                    )
+                except judgments.ScoringUnsupported as error:
+                    raise APIError(500, str(error), "scoring_unsupported") from error
+                except (APIError, judgments.SystemOneError):
+                    raise
+                except Exception as error:
+                    raise APIError(
+                        500, "question prompt could not be rendered"
+                    ) from error
+                remaining_request_time(deadline)
+                total_tokens += len(tokens)
+                job = self._score_job(
+                    tokens,
+                    slot_ids,
+                    deadline,
+                    priority,
+                    {
+                        "prompt_sha256": judgments.digest(prompt),
+                        "answer_token_ids": tuple(slot_ids),
+                    },
+                )
+                jobs.append((qid, spec, job))
+        return jobs
 
     def apply_template(self, body, *, deadline=None):
         add_generation_prompt = body.get("add_generation_prompt", True)
@@ -440,9 +622,10 @@ class Frontend:
         remaining = remaining_request_time(deadline)
         with self.preparation_lock:
             self.preparation_waiting += 1
-        acquired = self.preparation_slots.acquire(
-            timeout=min(remaining, PREPARATION_WAIT_SECONDS)
-        )
+        with self.latencies.measure("preparation_queue"):
+            acquired = self.preparation_slots.acquire(
+                timeout=min(remaining, PREPARATION_WAIT_SECONDS)
+            )
         with self.preparation_lock:
             self.preparation_waiting -= 1
             if acquired:
@@ -456,7 +639,8 @@ class Frontend:
             )
         try:
             remaining_request_time(deadline)
-            yield
+            with self.latencies.measure("preparation"):
+                yield
         finally:
             with self.preparation_lock:
                 self.preparation_active -= 1
@@ -519,7 +703,15 @@ class Frontend:
             preserve_thinking,
         )
 
+    def _tokenize(self, text, **options):
+        with self.latencies.measure("tokenization"):
+            return self.tokenizer(text, **options)
+
     def _apply_chat_template(self, messages, template):
+        with self.latencies.measure("template"):
+            return self._render_template(messages, template)
+
+    def _render_template(self, messages, template):
         try:
             return self.tokenizer.apply_chat_template(messages, **template)
         except TemplateError:
@@ -546,7 +738,8 @@ class Frontend:
             template["preserve_thinking"] = prompt.preserve_thinking
         if prompt.tools:
             template["tools"] = prompt.tools
-        images = self._prepare_images(prompt.messages, check_context=check_context)
+        with self.latencies.measure("images"):
+            images = self._prepare_images(prompt.messages, check_context=check_context)
         remaining_request_time(deadline)
         if images and self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN) is None:
             raise APIError(400, "the tokenizer does not define the image pad token")
@@ -558,7 +751,7 @@ class Frontend:
                 )
             else:
                 rendered = self._apply_chat_template(prompt.messages, template)
-                tokens = self.tokenizer(rendered, add_special_tokens=False)["input_ids"]
+                tokens = self._tokenize(rendered, add_special_tokens=False)["input_ids"]
         except APIError:
             raise
         except Exception as error:
@@ -674,11 +867,13 @@ class Frontend:
         if self.constraint_factory is not None:
             if tools:
                 constraint = self.constraint_factory.create(
-                    tool_grammar(tool_policy, thinking, response_schema)
+                    tool_grammar(tool_policy, thinking, response_schema),
+                    timeout=remaining_request_time(deadline),
                 )
             elif response_schema is not None:
                 constraint = self.constraint_factory.create(
-                    json_grammar(response_schema, thinking)
+                    json_grammar(response_schema, thinking),
+                    timeout=remaining_request_time(deadline),
                 )
         remaining_request_time(deadline)
         tools_signature = None
@@ -694,7 +889,7 @@ class Frontend:
             )
         remaining_request_time(deadline)
         if len(prompt_tokens) >= self.max_context:
-            raise ContextLengthError(len(prompt_tokens), self.max_context)
+            raise ContextLengthError(len(prompt_tokens), self.max_context - 1)
         max_new = body.get(
             "max_completion_tokens",
             body.get(
@@ -719,12 +914,7 @@ class Frontend:
             seed = secrets.randbits(64)
         if not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**64:
             raise APIError(400, "seed must be an unsigned 64-bit integer")
-        priority_name = body.get("priority", "normal")
-        if (
-            not isinstance(priority_name, str)
-            or priority_name not in REQUEST_PRIORITIES
-        ):
-            raise APIError(400, "priority must be foreground, normal, or background")
+        priority = self._priority(body)
         request_id = next(self.ids)
         job = Job(
             request_id=request_id,
@@ -735,10 +925,12 @@ class Frontend:
             top_p=top_p,
             top_k=top_k,
             deadline=deadline,
-            priority=REQUEST_PRIORITIES[priority_name],
+            priority=priority,
             stop_sequences=stop_sequences,
             thinking=thinking,
-            thinking_display=body.get("thinking_display", "summarized"),
+            thinking_display=(
+                "omitted" if body.get("thinking_display") == "omitted" else "summarized"
+            ),
             tool_policy=tool_policy,
             response_validator=response_validator,
             response_format=body.get("response_format"),
@@ -751,7 +943,7 @@ class Frontend:
         )
         return job, thinking, bool(tools)
 
-    def prepare_responses(self, body, *, deadline=None):
+    def prepare_responses(self, body, *, deadline=None, reserve_input=None):
         if deadline is None:
             deadline = self.request_deadline(body)
         store = body.get("store")
@@ -763,22 +955,28 @@ class Frontend:
             not isinstance(previous_id, str) or not previous_id
         ):
             raise APIError(400, "previous_response_id must be a non-empty string")
-        previous = None
-        if previous_id is not None:
-            previous = self.response_store.get(previous_id)
-            if previous is None:
-                raise APIError(404, "response not found", "not_found_error")
-        previous_items = previous.history_items if previous is not None else []
-        chat = responses_to_chat_body(body, previous_items)
-        namespaces = chat.pop("_tool_namespaces")
-        job, thinking, has_tools = self.prepare(chat, namespaces, deadline=deadline)
-        job.response_store = store
-        job.response_previous_id = previous_id
-        job.response_history_items = [
-            *copy.deepcopy(previous_items),
-            *canonical_responses_input(body.get("input")),
-        ]
-        return job, thinking, has_tools
+        with self._preparation(deadline):
+            previous_items = []
+            if previous_id is not None:
+                previous = self.response_store.get(previous_id)
+                if previous is None:
+                    raise APIError(404, "response not found", "not_found_error")
+                # The immutable record remains valid if the store evicts it.
+                # Reserve its input bytes before materializing the history.
+                if reserve_input is not None:
+                    reserve_input(len(previous.history_json))
+                previous_items = json_codec.loads(previous.history_json)
+            chat = responses_to_chat_body(body, previous_items)
+            namespaces = chat.pop("_tool_namespaces")
+            job, thinking, has_tools = self._prepare(chat, namespaces, deadline)
+            job.response_store = store
+            job.response_previous_id = previous_id
+            if store:
+                job.response_history_items = [
+                    *previous_items,
+                    *canonical_responses_input(body.get("input")),
+                ]
+            return job, thinking, has_tools
 
     def persist_response(self, job, response, output):
         if not job.response_store:

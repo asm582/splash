@@ -56,6 +56,9 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 Reasoning is on by default. `"reasoning_effort": "none"` turns it off, and
 Qwen3.8-27B also takes `low`, `medium`, and `xhigh`.
 
+`/v1/judgments` and `/v1/systemone` provide scoring without generation.
+See [judgment contracts](DEVELOPMENT.md#judgment-contracts) for details.
+
 ## Models
 
 | Package (`--model`) | Contents | Download |
@@ -69,14 +72,7 @@ Transformers checkpoints do not work. Private repositories need `HF_TOKEN`.
 Packages download into the Hugging Face cache, and `brew upgrade splash` keeps
 them, along with model links and agent sessions.
 
-To download new models to another disk, set `HF_HUB_CACHE` before the first run:
-
-```bash
-HF_HUB_CACHE=/Volumes/Models/huggingface splash serve --model incoai/Qwen3.8-27B-Splash
-```
-
-Model links and agent sessions stay in Splash's data directory. Existing models
-are not moved.
+For a custom model download location, see [model cache](DEVELOPMENT.md#model-cache).
 
 ## Settings
 
@@ -86,17 +82,15 @@ depends on available memory.
 
 `splash serve` accepts these optional flags:
 
-- `--port`: local HTTP port. Defaults to `SPLASH_PORT` or `8000`.
+- `--host`: HTTP bind address. Default: `127.0.0.1`.
+- `--port`: HTTP port. Defaults to `SPLASH_PORT` or `8000`.
 - `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
 - `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
-- `--allowed-host`: extra HTTP `Host` name to accept, for a proxy. Repeatable.
+- `--allowed-host`: extra HTTP `Host` name to accept, not a bind address. Repeatable.
 - `--api-key`: require this key on API requests, as a bearer token or
   `x-api-key`. Defaults to `SPLASH_API_KEY`.
 - `--no-webui`: turn off the chat page.
-
-Set `SPLASH_PORT` in both the server and agent shells to use another port.
-Separate ports allow separate servers; their memory limits are independent.
 
 If the model does not fit in the memory available, startup prints a memory
 budget breakdown and stops.
@@ -105,10 +99,10 @@ Authentication is off by default. Set `SPLASH_API_KEY` in the shell that runs
 `splash serve` and in the shell that runs an agent, and both sides use it.
 Health and readiness probes stay public.
 
-- Experimental cache offloading: [PR #3](https://github.com/incoai/splash/pull/3)
-  adds SSD offloading for KV cache and GDN states. Build from that branch and
-  set `--max-cache-disk 8G` to enable it. This helps preserve reusable prefixes
-  when RAM is limited, reducing repeated prefill.
+For LAN access and multiple servers, see
+[server configuration](DEVELOPMENT.md#server-configuration).
+
+Experimental cache offloading: [PR #3](https://github.com/incoai/splash/pull/3).
 
 ## Performance
 

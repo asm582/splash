@@ -1030,6 +1030,45 @@ int main(int argc, char **argv) {
     beginCold(executor, reusedId, 0);
     executor.end(1);
 
+    // Direct score-only prefill: raw final-position logits, no sampling or
+    // decode. The greedy first generated token must be the max among options.
+    {
+      const uint32_t greedy = decoded.outputTokens.front();
+      const uint32_t otherA = greedy == 1 ? 2u : 1u;
+      const uint32_t otherB = greedy == 7 ? 8u : 7u;
+      EngineRequest scored = makeRequest(99, prompt128, 0);
+      scored.scoreTokens = {greedy, otherA, otherB};
+      scored.imagePixels = {0};
+      bool pixelsRejected = false;
+      try {
+        beginCold(executor, scored, 0);
+      } catch (const std::invalid_argument &) {
+        pixelsRejected = true;
+      }
+      require(pixelsRejected, "score request accepted image pixels without spans");
+      scored.imagePixels.clear();
+      beginCold(executor, scored, 0);
+      ModelStepResult scoredResult =
+          prefillChunk(executor, 99, 0, 0, 0, prompt128, pageTable);
+      require(scoredResult.finished && scoredResult.outputTokens.empty() &&
+                  scoredResult.scoreLogits.size() == 3,
+              "score prefill did not return ordered logits without tokens");
+      for (float logit : scoredResult.scoreLogits)
+        require(std::isfinite(logit), "score logit is not finite");
+      require(scoredResult.scoreLogits[0] >= scoredResult.scoreLogits[1] &&
+                  scoredResult.scoreLogits[0] >= scoredResult.scoreLogits[2],
+              "greedy decode token is not the maximum scored logit");
+      bool decodeRejected = false;
+      try {
+        decodeOne(executor, 99, 0, 128, pageTable, BatchCohort::Greedy);
+      } catch (const std::exception &) {
+        decodeRejected = true;
+      }
+      require(decodeRejected, "score request allowed a decode step");
+      executor.end(99);
+    }
+
+
     // Compare the active GDN state from one 16-row chunk and two M8 commits
     // within the numerical tolerance below. Their next-token decisions are
     // diagnostic because the command partitions round differently.
@@ -1689,13 +1728,21 @@ int main(int argc, char **argv) {
     std::array<std::vector<uint32_t>, 4> raggedPages{
         pageRange(52, 1), pageRange(53, 2), pageRange(55, 9),
         pageRange(64, 56)};
+    const auto raggedRequest = [&](uint64_t id, uint32_t lane) {
+      const bool sampled = lane % 2;
+      auto value = makeRequest(
+          id, raggedPrompts[lane], 16,
+          sampled ? BatchCohort::Sampling : BatchCohort::Greedy);
+      value.sampling = {sampled ? 0.8F : 0.0F, 0.95F, 20, 731 + lane};
+      return value;
+    };
     BatchPlan raggedPrefillPlan;
     raggedPrefillPlan.kind = WorkKind::Prefill;
     raggedPrefillPlan.cohort = BatchCohort::Greedy;
     std::array<ModelBatchItem, 4> raggedPrefillItems;
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       beginCold(executor,
-          makeRequest(raggedIds[lane], raggedPrompts[lane], 16),
+          raggedRequest(raggedIds[lane], lane),
           raggedSlots[lane]);
       raggedPrefillPlan.items.push_back({raggedIds[lane], raggedRows[lane]});
       raggedPrefillItems[lane] = {raggedIds[lane],  raggedSlots[lane], 0, 0,
@@ -1718,7 +1765,7 @@ int main(int argc, char **argv) {
 
     BatchPlan raggedDecodePlan;
     raggedDecodePlan.kind = WorkKind::Decode;
-    raggedDecodePlan.cohort = BatchCohort::Greedy;
+    raggedDecodePlan.cohort = BatchCohort::Sampling;
     std::array<ModelBatchItem, 4> raggedDecodeItems;
     for (uint32_t lane = 0; lane < raggedIds.size(); ++lane) {
       raggedDecodePlan.items.push_back({raggedIds[lane], 0});
@@ -1751,7 +1798,7 @@ int main(int argc, char **argv) {
       const uint32_t lane = raggedPermutation[order];
       const uint64_t referenceId = 104 + lane;
       beginCold(executor,
-          makeRequest(referenceId, raggedPrompts[lane], 16),
+          raggedRequest(referenceId, lane),
           referenceSlots[order]);
       raggedReferencePrefillPlan.items.push_back(
           {referenceId, raggedRows[lane]});
@@ -1767,7 +1814,7 @@ int main(int argc, char **argv) {
 
     BatchPlan raggedReferenceDecodePlan;
     raggedReferenceDecodePlan.kind = WorkKind::Decode;
-    raggedReferenceDecodePlan.cohort = BatchCohort::Greedy;
+    raggedReferenceDecodePlan.cohort = BatchCohort::Sampling;
     std::array<ModelBatchItem, 4> raggedReferenceDecodeItems;
     for (uint32_t order = 0; order < raggedPermutation.size(); ++order) {
       const uint32_t lane = raggedPermutation[order];

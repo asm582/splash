@@ -9,20 +9,24 @@ from dataclasses import dataclass, field
 from tokenizers.decoders import DecodeStream
 
 if __package__:
+    from . import json_codec
     from . import protocol as wire
     from . import runtime as engine_runtime
     from .constraints import TokenConstraint
     from .errors import APIError, NativeError
+    from .latency import RequestLatency
     from .metrics import metrics_dict
     from .output import hold_partial
-    from .tool_schema import THINK_END, ToolPolicy, strict_json_loads
+    from .tool_schema import THINK_END, ToolPolicy
 else:
+    import json_codec
     import protocol as wire
     from constraints import TokenConstraint
     from errors import APIError, NativeError
+    from latency import RequestLatency
     from metrics import metrics_dict
     from output import hold_partial
-    from tool_schema import THINK_END, ToolPolicy, strict_json_loads
+    from tool_schema import THINK_END, ToolPolicy
 
     import runtime as engine_runtime
 
@@ -71,6 +75,8 @@ class NativeResult:
     cache: CacheInfo = field(default_factory=CacheInfo)
     stop_sequence: str | None = None
     first_token_batch_tokens: int = 0
+    # Raw option logits for score-only jobs, in requested token order.
+    option_logits: tuple = ()
 
 
 @dataclass
@@ -110,6 +116,11 @@ class Job:
     response_previous_id: str | None = None
     response_history_items: list | None = None
     return_progress: bool = False
+    # Option token ids for score-only jobs; empty means ordinary generation.
+    score_tokens: tuple = ()
+    # Endpoint-specific metadata carried to the response builder.
+    meta: dict | None = None
+    latency: RequestLatency | None = None
 
 
 class CallbackStreamer:
@@ -284,7 +295,7 @@ class NativeBackend:
 
     @staticmethod
     def _decode_status_event(event):
-        snapshot = strict_json_loads(event.json)
+        snapshot = json_codec.loads(event.json)
         if (
             event.schema_version != wire.STATUS_SCHEMA_VERSION
             or not isinstance(snapshot, dict)
@@ -461,6 +472,7 @@ class NativeBackend:
             image_pixels=job.image_pixels,
             image_owner=job.image_owner,
             return_progress=job.return_progress,
+            score_tokens=job.score_tokens,
         )
 
     def submit(self, job):
@@ -552,7 +564,8 @@ class NativeBackend:
                     # deadline.
                     request = self._generation_request(job)
             with self.lock:
-                state.call = call
+                if not state.detached:
+                    state.call = call
                 cancel = state.detached or self.closing or job.cancelled.is_set()
             if cancel:
                 call.cancel()
@@ -603,6 +616,8 @@ class NativeBackend:
                     )
                 )
             elif isinstance(event, wire.TokensEvent):
+                if job.latency is not None and event.tokens:
+                    job.latency.tokens()
                 if event.sequence_offset == 0:
                     state.first_token_batch_tokens = len(event.tokens)
                 if job.constraint is not None:
@@ -663,6 +678,7 @@ class NativeBackend:
                     if stop_sequence is not None
                     else done.completion_tokens
                 ),
+                option_logits=done.option_logits,
                 start_to_first_token_ms=done.prefill_micros / 1000.0,
                 first_token_to_done_ms=done.decode_micros / 1000.0,
                 request_wall_ms=done.wall_micros / 1000.0,
@@ -671,6 +687,11 @@ class NativeBackend:
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
             )
+            if job.latency is not None:
+                latency = metrics_dict(result)["request_latency"]
+                queued = latency.get("queue_to_start_ms")
+                if queued is not None:
+                    job.latency.metrics.observe("native_queue", queued / 1000.0)
         except Exception as unexpected:
             error = self._api_error(unexpected)
         finally:

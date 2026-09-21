@@ -8,19 +8,22 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 if __package__:
     from .errors import APIError
+    from .protocol import ProtocolLimits
 else:
     from errors import APIError
+    from protocol import ProtocolLimits
 
-MAX_PDF_BYTES = 10 * 1024 * 1024
-MAX_PAGES = 20
+MAX_REQUEST_DOCUMENT_BYTES = 64 * 1024 * 1024
+MAX_PDF_BYTES = MAX_REQUEST_DOCUMENT_BYTES
+# Every rendered page becomes one image in the native request.
+MAX_PAGES = ProtocolLimits().max_image_spans
 MAX_PAGE_PIXELS = 1024 * 1024
 MAX_TEXT_CHARACTERS = 1_000_000
 MAX_RENDERED_BYTES = 32 * 1024 * 1024
-MAX_REQUEST_DOCUMENT_BYTES = 64 * 1024 * 1024
 CACHE_BYTES = 64 * 1024 * 1024
 CACHE_ENTRIES = 16
 
@@ -29,6 +32,7 @@ CACHE_ENTRIES = 16
 class DocumentBudget:
     deadline: float | None = None
     remaining_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
+    remaining_pages: int = MAX_PAGES
 
     def remaining_time(self):
         if self.deadline is None:
@@ -41,8 +45,16 @@ class DocumentBudget:
     def charge(self, size):
         self.remaining_time()
         if size > self.remaining_bytes:
-            raise APIError(400, "documents exceed the request size limit")
+            raise APIError(
+                400,
+                "PDF sources and rendered pages exceed the shared request size limit",
+            )
         self.remaining_bytes -= size
+
+    def charge_pages(self, count):
+        if count > self.remaining_pages:
+            raise APIError(400, "documents exceed the request page limit")
+        self.remaining_pages -= count
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +73,7 @@ class RenderLimits:
     page_pixels: int
     text_characters: int
     rendered_bytes: int
+    request_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
 
 
 def _render_limits():
@@ -81,7 +94,13 @@ def _render(payload, budget):
     else:
         from document_worker import render
 
-    values = render(payload, asdict(_render_limits()), budget.remaining_time())
+    limits = _render_limits()
+    limits = replace(
+        limits,
+        pages=min(limits.pages, budget.remaining_pages),
+        request_bytes=budget.remaining_bytes,
+    )
+    values = render(payload, asdict(limits), budget.remaining_time())
     pages = tuple(Page(**value) for value in values)
     budget.charge(sum(page.size for page in pages))
     return pages
@@ -99,6 +118,7 @@ def render_pages(payload, budget, limits=None):
                 raise APIError(
                     400, f"PDF documents must contain 1–{limits.pages} pages"
                 )
+            budget.charge_pages(len(document))
             pages = []
             total_characters = total_bytes = 0
             for index in range(len(document)):
@@ -138,9 +158,9 @@ def render_pages(payload, budget, limits=None):
                     ).decode("ascii")
                     prepared = Page(f"PDF page {index + 1}:\n{text}\n", image_url)
                     total_bytes += prepared.size
+                    budget.charge(prepared.size)
                     if total_bytes > limits.rendered_bytes:
                         raise APIError(400, "rendered PDF exceeds the size limit")
-                    budget.charge(prepared.size)
                     pages.append(prepared)
             return tuple(pages)
     except APIError:
@@ -171,13 +191,16 @@ def _pages(encoded, budget):
             raise APIError(400, "PDF data is not valid base64") from error
         if len(payload) > MAX_PDF_BYTES:
             raise APIError(400, "PDF document exceeds the size limit")
+        budget.charge(len(payload))
         key = hashlib.sha256(payload).digest()
         cached = _cache.get(key)
         if cached is not None:
+            budget.charge_pages(len(cached))
             budget.charge(sum(page.size for page in cached))
             _cache.move_to_end(key)
             return cached
         pages = _render(payload, budget)
+        budget.charge_pages(len(pages))
         size = sum(page.size for page in pages)
         if size <= CACHE_BYTES:
             _cache[key] = pages

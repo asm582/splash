@@ -37,7 +37,9 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
 }
 
 void Engine::submit(EngineRequest value) {
-  if (!value.id || value.prompt.empty() || !value.maxNewTokens ||
+  const bool scoring = !value.scoreTokens.empty();
+  if (!value.id || value.prompt.empty() ||
+      (scoring ? value.maxNewTokens != 0 : !value.maxNewTokens) ||
       value.prompt.size() + value.maxNewTokens > config_.maxContext ||
       !std::isfinite(value.deadlineMilliseconds) ||
       value.deadlineMilliseconds <= 0.0) {
@@ -66,6 +68,26 @@ void Engine::submit(EngineRequest value) {
     throw std::invalid_argument("invalid backend request image pixels");
   }
   const uint64_t id = value.id;
+  if (scoring) {
+    if (value.cohort != BatchCohort::Greedy ||
+        value.constraint != ConstraintMode::None || !value.images.empty() ||
+        value.sampling.temperature != 0.0f || value.sampling.topP != 1.0f ||
+        value.sampling.topK != 0 ||
+        value.scoreTokens.size() < model::ExecutionLimits::minimumScoreOptions ||
+        value.scoreTokens.size() > model::ExecutionLimits::maximumScoreOptions) {
+      throw std::invalid_argument("invalid score request");
+    }
+    std::vector<uint32_t> distinct(value.scoreTokens.begin(),
+                                   value.scoreTokens.end());
+    std::sort(distinct.begin(), distinct.end());
+    if (std::adjacent_find(distinct.begin(), distinct.end()) !=
+            distinct.end() ||
+        std::any_of(distinct.begin(), distinct.end(), [&](uint32_t token) {
+          return token >= config_.vocabularySize;
+        })) {
+      throw std::invalid_argument("score token is out of vocabulary");
+    }
+  }
   Request requestState;
   requestState.promptTokens = static_cast<uint32_t>(value.prompt.size());
   requestState.replayTokens = requestState.promptTokens;
@@ -99,7 +121,7 @@ void Engine::cancel(uint64_t id) {
       }
     }
   }
-  finish(found->second, EngineFinishReason::Cancelled);
+  finish(found->second, EngineFinishReason::Cancelled, {});
 }
 
 void Engine::failRequest(uint64_t id, std::string code, std::string message) {
@@ -284,18 +306,95 @@ bool Engine::admitQueued(double now) {
     recoveringResources_ = false;
   if (drainingForRecovery())
     return false;
-  bool progressed = false;
-  for (uint64_t requestId : scheduler_.admissionOrder()) {
-    Request &active = request(requestId);
-    if (recovering && !active.suspended)
-      continue;
+  const std::vector<uint64_t> order = scheduler_.admissionOrder();
+  if (recovering) {
+    for (uint64_t id : order) {
+      Request &active = request(id);
+      if (active.suspended && resourceRetryReady(active, now) && admit(active, now))
+        return true;
+    }
+    return false;
+  }
+
+  std::vector<PrefillAdmission> candidates;
+  for (uint64_t id : order) {
+    Request &active = request(id);
     if (!resourceRetryReady(active, now))
       continue;
-    progressed = admit(active, now) || progressed;
-    if (recovering && progressed)
+    const uint32_t cached =
+        cache_.cachedTokens(active.request.prompt, active.request.images);
+    if (pendingSharedPrefill(active, cached)) {
+      active.resourceWait = {};
+      scheduler_.waitForPrefix(id);
+      continue;
+    }
+    candidates.push_back({id, cached});
+  }
+  bool progressed = false;
+  while (!candidates.empty()) {
+    const auto selected = scheduler_.prefillAdmissionOrder(candidates);
+    if (selected.empty())
+      break;
+    for (uint64_t id : selected) {
+      progressed = admit(request(id), now) || progressed;
+      std::erase_if(candidates, [id](const auto &value) {
+        return value.requestId == id;
+      });
+    }
+    // Failed admissions must not prevent other eligible work from running.
+    if (progressed)
       break;
   }
+  // Waiting for scheduling does not consume the memory-retry deadline.
+  for (const auto &candidate : candidates) {
+    Request &active = request(candidate.requestId);
+    active.resourceWait = {};
+    scheduler_.deferAdmission(candidate.requestId);
+  }
   return progressed;
+}
+
+uint32_t Engine::sharedPrefillBoundary(const Request &left,
+                                       const Request &right) {
+  const auto prompt = [](const Request &value) -> std::span<const uint32_t> {
+    return value.exactTokens.empty()
+               ? std::span<const uint32_t>(value.request.prompt)
+               : std::span<const uint32_t>(value.exactTokens)
+                     .first(value.promptTokens);
+  };
+  const auto a = prompt(left);
+  const auto b = prompt(right);
+  const auto end = std::mismatch(a.begin(), a.end(), b.begin(), b.end()).first;
+  uint32_t boundary = std::min<uint32_t>(
+      static_cast<uint32_t>(end - a.begin()),
+      std::min(replayStateBoundary(left.promptTokens),
+               replayStateBoundary(right.promptTokens)));
+  boundary -= boundary % KvCache::pageTokens;
+  if (!left.request.images.empty() || !right.request.images.empty()) {
+    for (uint32_t offset = 0; offset < boundary; offset += KvCache::pageTokens) {
+      if (blockImageIdentity(offset, KvCache::pageTokens, left.request.images) !=
+          blockImageIdentity(offset, KvCache::pageTokens, right.request.images))
+        return offset;
+    }
+  }
+  return boundary;
+}
+
+bool Engine::pendingSharedPrefill(const Request &active,
+                                  uint32_t resumeBoundary) const {
+  for (const auto &[id, peer] : requests_) {
+    if (!peer.stateCell || peer.finalized || peer.failure ||
+        peer.request.priority > active.request.priority ||
+        scheduler_.phase(id) != Phase::Prefill)
+      continue;
+    const uint32_t shared = sharedPrefillBoundary(active, peer);
+    for (size_t i = peer.stateBoundaryCursor; i < peer.stateBoundaries.size(); ++i) {
+      const uint32_t boundary = peer.stateBoundaries[i].tokens;
+      if (boundary > resumeBoundary && boundary <= shared)
+        return true;
+    }
+  }
+  return false;
 }
 
 bool Engine::admit(Request &active, double now) {
@@ -305,6 +404,13 @@ bool Engine::admit(Request &active, double now) {
     modelRequest.prompt = active.exactTokens;
   CacheLookup lookup =
       cache_.lookup(modelRequest.prompt, active.request.images);
+  // Only unstarted requests wait for a resident producer. Recheck planned
+  // boundaries each step so producer loss leaves no stale dependency or lease.
+  if (!resuming && pendingSharedPrefill(active, lookup.resumeBoundary())) {
+    active.resourceWait = {};
+    scheduler_.waitForPrefix(active.request.id);
+    return false;
+  }
   bool executorStarted = false;
   bool resourcesStarted = false;
   try {
@@ -507,21 +613,55 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
               return left.tokens < right.tokens;
             });
 
+  static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary));
+
   try {
-    std::vector<uint32_t> materializationBoundaries;
-    materializationBoundaries.reserve(active.stateBoundaries.size());
-    for (const auto &boundary : active.stateBoundaries)
-      materializationBoundaries.push_back(boundary.tokens);
-    DraftContextPlan draft = planDraftContext(
-        stateBoundary, active.replayTokens,
-        stateBoundary ? std::optional<uint32_t>(stateBoundary) : std::nullopt,
-        materializationBoundaries);
+    DraftContextPlan draft = pendingDraftStatePlan(active, stateBoundary);
     armNextStateBoundary(active);
     return draft;
   } catch (...) {
     discardPendingStateBoundaries(active);
     throw;
   }
+}
+
+bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
+  if (active.suspended || active.replaying)
+    return false;
+  bool changed = false;
+  const uint32_t replay = replayStateBoundary(active.replayTokens);
+  for (const auto &[id, peer] : requests_) {
+    if (id == active.request.id || peer.stateCell || peer.suspended ||
+        peer.finalized || peer.failure ||
+        peer.request.priority < active.request.priority)
+      continue;
+    const uint32_t shared = sharedPrefillBoundary(active, peer);
+    if (shared <= after || shared >= replay)
+      continue;
+    auto found = std::lower_bound(
+        active.stateBoundaries.begin(), active.stateBoundaries.end(), shared,
+        [](const auto &point, uint32_t tokens) { return point.tokens < tokens; });
+    if (found == active.stateBoundaries.end() || found->tokens != shared) {
+      active.stateBoundaries.insert(
+          found, {shared, Request::StateBoundary::Purpose::Junction});
+      changed = true;
+    } else if (found->purpose == Request::StateBoundary::Purpose::Checkpoint) {
+      found->purpose = Request::StateBoundary::Purpose::Junction;
+    }
+  }
+  return changed;
+}
+
+DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
+                                               uint32_t stateBoundary) const {
+  std::vector<uint32_t> boundaries;
+  boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
+  for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
+    boundaries.push_back(active.stateBoundaries[i].tokens);
+  return planDraftContext(
+      stateBoundary, active.replayTokens,
+      stateBoundary ? std::optional<uint32_t>(stateBoundary) : std::nullopt,
+      boundaries);
 }
 
 void Engine::armNextStateBoundary(Request &active) {
@@ -559,6 +699,7 @@ bool Engine::retireCheckpoint(Request &active) {
 
 void Engine::publishReachedStateBoundaries(Request &active,
                                            uint32_t promptProcessed) {
+  bool materialized = false;
   while (active.stateBoundaryCursor < active.stateBoundaries.size() &&
          active.stateBoundaries[active.stateBoundaryCursor].tokens <=
              promptProcessed) {
@@ -580,6 +721,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
       ++failures;
       continue;
     }
+    materialized = true;
     try {
       const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
       if (cache_.reuseCompositeState(block, checkpoint)) {
@@ -613,6 +755,11 @@ void Engine::publishReachedStateBoundaries(Request &active,
       ++failures;
     }
   }
+  // Late siblings can extend the remaining plan only where both target and
+  // draft states are complete, never at an arbitrary in-flight chunk boundary.
+  if (materialized && addSharedPrefillBoundaries(active, promptProcessed))
+    model_.setDraftContextPlan(
+        active.request.id, pendingDraftStatePlan(active, promptProcessed));
   if (active.stateBoundaryCursor == active.stateBoundaries.size()) {
     active.stateBoundaries.clear();
     active.stateBoundaryCursor = 0;
@@ -871,10 +1018,16 @@ void Engine::apply(const BatchPlan &plan,
       throw std::logic_error("model result order changed");
     }
     Request &active = request(result.requestId);
+    if (!result.failure.empty() && !active.failure) {
+      // The model rejected this lane's own numerical result. An earlier
+      // cancellation or deadline failure of the same lane still stands.
+      active.failure = Failure{"model_result_invalid", result.failure};
+    }
     if (active.failure) {
       // An in-flight Metal command cannot be revoked safely. Its provisional
-      // writes remain invisible, but a cancelled/deadline-expired request
-      // must not publish cache state or emit output when that command drains.
+      // writes remain invisible, but a cancelled, deadline-expired or
+      // model-rejected request must not publish cache state or emit output
+      // when that command drains.
       schedulerResults.push_back({active.request.id,
                                   result.consumedPromptTokens, true,
                                   result.nextDecodeStage});
@@ -925,8 +1078,27 @@ void Engine::apply(const BatchPlan &plan,
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;
+    const bool scoring = !active.request.scoreTokens.empty();
+    if (scoring && !result.outputTokens.empty()) {
+      throw std::logic_error("score request produced output tokens");
+    }
+    if (!result.scoreLogits.empty()) {
+      if (!scoring ||
+          result.scoreLogits.size() != active.request.scoreTokens.size()) {
+        throw std::logic_error("model returned mismatched score logits");
+      }
+      active.scoreLogits = result.scoreLogits;
+    }
+    // Score requests carry maxNewTokens == 0; only the model's finished flag
+    // on the final prompt chunk completes them.
     const bool complete =
-        result.finished || completionTokens >= active.request.maxNewTokens;
+        result.finished ||
+        (!scoring && completionTokens >= active.request.maxNewTokens);
+    if (scoring && complete &&
+        item.promptOffset + result.consumedPromptTokens !=
+            active.promptTokens) {
+      throw std::logic_error("score request finished before the prompt ended");
+    }
     if (result.outputTokensWithoutKv && !complete) {
       throw std::logic_error("model emitted an uncommitted token and continued");
     }
@@ -948,18 +1120,20 @@ void Engine::apply(const BatchPlan &plan,
       Failure failure = std::move(*active.failure);
       active.failure.reset();
       if (failure.code == "cancelled") {
-        finish(active, EngineFinishReason::Cancelled);
+        finish(active, EngineFinishReason::Cancelled, {});
       } else {
         finishFailure(active, std::move(failure));
       }
     } else if (schedulerResults[index].finished) {
       finish(active, result.finished ? EngineFinishReason::Stop
-                                     : EngineFinishReason::Length);
+                                     : EngineFinishReason::Length,
+             active.scoreLogits);
     }
   }
 }
 
-void Engine::finish(Request &active, EngineFinishReason reason) {
+void Engine::finish(Request &active, EngineFinishReason reason,
+                    std::span<const float> optionLogits) {
   if (active.finalized)
     return;
   if (reason == EngineFinishReason::Cancelled) {
@@ -972,7 +1146,7 @@ void Engine::finish(Request &active, EngineFinishReason reason) {
                                   active.promptTokens)
           : 0;
   events_.completed(active.request.id, reason, active.promptTokens,
-                    completionTokens);
+                    completionTokens, optionLogits);
   if (reason == EngineFinishReason::Cancelled) {
     ++counters_.cancelled;
   } else {

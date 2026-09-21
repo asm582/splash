@@ -13,6 +13,7 @@ import socket
 import sys
 import threading
 import time
+import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
@@ -22,6 +23,7 @@ from transformers import AutoTokenizer
 
 if __package__:
     from . import images as image_input
+    from . import json_codec, judgments
     from . import runtime as engine_runtime
     from .api_shapes import (
         anthropic_response,
@@ -42,6 +44,7 @@ if __package__:
     from .errors import APIError, ContextLengthError
     from .frontend import Frontend
     from .http_security import authenticate, validate_api_key, validate_headers
+    from .latency import RequestLatency
     from .metrics import (
         is_finite_number,
         metrics_dict,
@@ -57,9 +60,10 @@ if __package__:
         validate_tool_calls,
     )
     from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
-    from .tool_schema import strict_json_loads
 else:
     import images as image_input
+    import json_codec
+    import judgments
     from api_shapes import (
         anthropic_response,
         anthropic_stop,
@@ -79,6 +83,7 @@ else:
     from errors import APIError, ContextLengthError
     from frontend import Frontend
     from http_security import authenticate, validate_api_key, validate_headers
+    from latency import RequestLatency
     from metrics import is_finite_number, metrics_dict, prometheus_metrics, usage_dict
     from output import (
         ReasoningSplitter,
@@ -89,19 +94,47 @@ else:
         validate_tool_calls,
     )
     from thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
-    from tool_schema import strict_json_loads
 
     import runtime as engine_runtime
 
 
-MAX_REQUEST_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
+# Match the former generation ingress envelope (32 slots × 16 MiB).
+DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
 MAX_CONTEXT_TOKENS = 262144
 HTTP_IO_TIMEOUT = 30.0
+HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
 CLIENT_DISCONNECT_POLL = 0.01
 SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
+
+
+def _normalize_path(raw_path):
+    """Canonicalize a request target for route and header decisions.
+
+    Strips any query string or fragment, percent-decodes, and resolves
+    ``.`` and ``..`` segments so encoded or dotted spellings of a route
+    are treated exactly like the route itself.
+    """
+    decoded = unquote(raw_path.partition("?")[0].partition("#")[0])
+    if not decoded.startswith("/"):
+        return decoded
+    trailing = decoded.endswith("/") and len(decoded) > 1
+    segments = []
+    for segment in decoded.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(segment)
+    normalized = "/" + "/".join(segments)
+    if trailing and normalized != "/":
+        normalized += "/"
+    return normalized
 
 
 class FrontendHandler(BaseHTTPRequestHandler):
@@ -175,13 +208,28 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
+        path = _normalize_path(getattr(self, "path", ""))
+        if (
+            path == "/v1/systemone"
+            or path == "/v1/models"
+            or path.startswith("/v1/models/")
+        ):
+            self.send_header("x-typesafe-request-id", f"req_{secrets.token_hex(12)}")
         self._response_started = True
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
 
     def _json(self, status, payload):
-        data = json.dumps(payload, separators=(",", ":")).encode()
+        try:
+            data = json_codec.encode(payload)
+        except json_codec.JSONEncodingError as error:
+            log_unexpected(error)
+            self._error(
+                APIError(500, "internal server error", "internal_server_error"),
+                self.path.partition("?")[0].startswith("/v1/messages"),
+            )
+            return
         self._send(status, data, "application/json")
 
     def _error(self, error, anthropic=False):
@@ -222,7 +270,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
-    def _read_json_body(self):
+    def _read_json_body(self, deadline):
         if self.headers.get_all("Transfer-Encoding"):
             raise APIError(400, "transfer encoding is not supported")
         encodings = self.headers.get_all("Content-Encoding", [])
@@ -248,23 +296,39 @@ class FrontendHandler(BaseHTTPRequestHandler):
         length = int(lengths[0])
         if length <= 0:
             raise APIError(400, "request body must not be empty")
-        if length > MAX_REQUEST_BYTES:
-            raise APIError(413, "request body is too large")
-        deadline = time.monotonic() + self.server.io_timeout
+        if length > self.server.max_request_bytes:
+            raise APIError(
+                413,
+                f"request body is {length} bytes; limit is "
+                f"{self.server.max_request_bytes} bytes (--max-request-size)",
+                "request_too_large",
+            )
+        # Bound total upload time even when a client keeps the socket active.
+        deadline = min(
+            deadline,
+            time.monotonic()
+            + self.server.io_timeout
+            + length / HTTP_UPLOAD_BYTES_PER_SECOND,
+        )
+        self._body_reservation = RequestBodyReservation(
+            self.server.request_bodies, length
+        )
         payload = bytearray()
         try:
             while len(payload) < length:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError
-                self.connection.settimeout(remaining)
+                self.connection.settimeout(min(remaining, self.server.io_timeout))
                 chunk = self.rfile.read1(min(65536, length - len(payload)))
                 if not chunk:
                     raise APIError(400, "request body ended before Content-Length")
                 payload.extend(chunk)
         finally:
             self.connection.settimeout(self.server.io_timeout)
-        return strict_json_loads(payload)
+        text = payload.decode(json.detect_encoding(payload), "surrogatepass")
+        payload.clear()
+        return json_codec.loads(text)
 
     def do_HEAD(self):
         self.do_GET()
@@ -315,16 +379,24 @@ class FrontendHandler(BaseHTTPRequestHandler):
             else:
                 self._json(200, stored.response)
             return
-        if path == "/v1/models" or path.startswith("/v1/models/"):
+        model_path = _normalize_path(self.path)
+        if model_path == "/v1/models" or model_path.startswith("/v1/models/"):
             model = {
                 "id": self.app.model,
                 "object": "model",
                 "created": 0,
                 "owned_by": "splash",
             }
-            if path == "/v1/models":
-                self._json(200, {"object": "list", "data": [model]})
-            elif unquote(path.removeprefix("/v1/models/")) == self.app.model:
+            # TypeSafe SDK compatibility: models.list() reads "models" entries.
+            # The release date is not tracked locally and stays unknown.
+            typed = {
+                "name": self.app.model,
+                "description": "Splash resident model",
+                "release_date": "",
+            }
+            if model_path == "/v1/models":
+                self._json(200, {"object": "list", "data": [model], "models": [typed]})
+            elif model_path.removeprefix("/v1/models/") == self.app.model:
                 self._json(200, model)
             else:
                 self._safe_error(APIError(404, "model not found", "model_not_found"))
@@ -349,6 +421,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         started_at = time.monotonic()
         job = None
+        body = None
+        self._body_reservation = None
         submitted = False
         # Route on the URL path so standard protocol query parameters do not
         # turn a supported endpoint into an unknown one.
@@ -356,6 +430,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         count_tokens = path == "/v1/messages/count_tokens"
         prompt_only = count_tokens or path in ("/tokenize", "/apply-template")
         anthropic = path == "/v1/messages" or count_tokens
+        systemone = path == "/v1/systemone"
         if path not in (
             "/v1/chat/completions",
             "/v1/responses",
@@ -363,13 +438,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "/v1/messages/count_tokens",
             "/tokenize",
             "/apply-template",
+            "/v1/judgments",
+            "/v1/systemone",
         ):
             self._safe_error(APIError(404, "not found", "not_found"))
             return
         if not prompt_only and not self.app.backend.can_submit():
             self._safe_error(
                 APIError(
-                    503, "engine is recovering; retry shortly", "engine_recovering"
+                    529 if systemone else 503,
+                    "engine is recovering; retry shortly",
+                    "engine_recovering",
                 ),
                 anthropic,
                 log=False,
@@ -382,16 +461,30 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if not admission.acquire():
             self._safe_error(
                 APIError(
-                    503, "frontend request capacity is exhausted", "frontend_overloaded"
+                    529 if systemone else 503,
+                    "frontend request capacity is exhausted",
+                    "frontend_overloaded",
                 ),
                 anthropic,
             )
             return
         try:
-            body = self._read_json_body()
+            with self.app.latencies.measure("upload"):
+                body = self._read_json_body(started_at + self.app.request_timeout)
             if not isinstance(body, dict):
+                if systemone:
+                    raise judgments.SystemOneError(
+                        [judgments.detail([], "request body must be an object")]
+                    )
                 raise APIError(400, "request body must be an object")
-            deadline = self.app.request_deadline(body, started_at)
+            try:
+                deadline = self.app.request_deadline(body, started_at)
+            except APIError as error:
+                if systemone:
+                    raise judgments.SystemOneError(
+                        [judgments.detail(["timeout"], error.message)]
+                    ) from error
+                raise
             if path == "/tokenize":
                 self._json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
                 return
@@ -410,6 +503,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     deadline=deadline,
                 )
                 self._json(200, {"input_tokens": tokens})
+                return
+            if path == "/v1/judgments":
+                job, row = self.app.prepare_judgment(body, deadline=deadline)
+                remaining_request_time(deadline)
+                if self._client_disconnected():
+                    raise ConnectionResetError("client disconnected before submission")
+                if not self.app.backend.submit(job):
+                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                submitted = True
+                self._judgment_complete(job, row)
+                return
+            if systemone:
+                self._systemone(body, deadline)
                 return
             responses = path == "/v1/responses"
             stream = body.get("stream", False)
@@ -435,7 +541,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 stream_options = None
             elif responses:
                 job, thinking, has_tools = self.app.prepare_responses(
-                    body, deadline=deadline
+                    body,
+                    deadline=deadline,
+                    reserve_input=self._body_reservation.grow,
                 )
                 stream_options = None
             else:
@@ -448,8 +556,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     or not isinstance(stream_options.get("include_usage", False), bool)
                 ):
                     raise APIError(400, "invalid streaming options")
+                stream_options = {
+                    "include_usage": stream_options.get("include_usage", False)
+                }
                 job, thinking, has_tools = self.app.prepare(body, deadline=deadline)
+            body = None
+            self._body_reservation.retain_for(job)
+            self._body_reservation = None
             job.return_progress = return_progress
+            job.latency = RequestLatency(self.app.latencies, started_at)
             remaining_request_time(deadline)
             if self._client_disconnected():
                 raise ConnectionResetError("client disconnected before submission")
@@ -468,6 +583,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._stream(job, thinking, has_tools, stream_options)
             else:
                 self._complete(job, thinking, has_tools)
+        except judgments.SystemOneError as error:
+            if submitted:
+                self.app.backend.cancel(job)
+            self._systemone_error(error)
         except (BrokenPipeError, ConnectionResetError):
             if submitted:
                 self.app.backend.cancel(job)
@@ -479,14 +598,23 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except APIError as error:
             if submitted:
                 self.app.backend.cancel(job)
+            if systemone and error.status == 503:
+                error = APIError(529, error.message, error.code)
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
             self._safe_error(error, anthropic, log=not submitted or error.status >= 500)
         except (ValueError, RecursionError):
             if submitted:
                 self.app.backend.cancel(job)
-            error = APIError(400, "invalid JSON request body")
-            self._safe_error(error, anthropic, log=not submitted)
+            if systemone:
+                self._systemone_error(
+                    judgments.SystemOneError(
+                        [judgments.detail([], "invalid JSON request body")]
+                    )
+                )
+            else:
+                error = APIError(400, "invalid JSON request body")
+                self._safe_error(error, anthropic, log=not submitted)
         except Exception as error:
             if submitted:
                 self.app.backend.cancel(job)
@@ -494,7 +622,91 @@ class FrontendHandler(BaseHTTPRequestHandler):
             error = APIError(500, "internal server error", "internal_server_error")
             self._safe_error(error, anthropic, log=False)
         finally:
+            body = None
+            if self._body_reservation is not None:
+                self._body_reservation.release()
+                self._body_reservation = None
             admission.release()
+            self.app.latencies.observe("http_request", time.monotonic() - started_at)
+
+    def _judgment_complete(self, job, row):
+        result = None
+        while result is None:
+            kind, value = self._next_event(job)
+            if kind == "done":
+                result = value
+        if result.reason == "cancelled":
+            if job.timed_out:
+                raise APIError(504, "request timed out", "request_timeout")
+            raise APIError(500, "request cancelled", "request_cancelled")
+        if result.reason != "stop" or len(result.option_logits) != len(
+            job.score_tokens
+        ):
+            raise APIError(500, "runtime protocol error", "protocol_error")
+        self._json(
+            200,
+            judgments.judgment_response(self.app.model, row, job.meta, result),
+        )
+
+    def _systemone(self, body, deadline):
+        active_job = None
+        try:
+            entries = self.app.prepare_systemone(body, deadline=deadline)
+            remaining_request_time(deadline)
+            if self._client_disconnected():
+                raise ConnectionResetError("client disconnected before submission")
+            answers = {}
+            input_tokens = 0
+            for qid, spec, job in entries:
+                if job is None:
+                    answers[qid] = judgments.deterministic_answer(spec)
+                    continue
+                # One admitted job per HTTP request preserves the existing
+                # queue bound and lets later questions reuse the state prefix.
+                active_job = job
+                if not self.app.backend.submit(job):
+                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                result = None
+                while result is None:
+                    kind, value = self._next_event(job)
+                    if kind == "done":
+                        result = value
+                if result.reason == "cancelled":
+                    if job.timed_out:
+                        raise APIError(504, "request timed out", "request_timeout")
+                    raise APIError(500, "request cancelled", "request_cancelled")
+                if result.reason != "stop" or len(result.option_logits) != len(
+                    job.score_tokens
+                ):
+                    raise APIError(500, "runtime protocol error", "protocol_error")
+                input_tokens += result.prompt_tokens
+                answers[qid] = judgments.systemone_answer(
+                    spec, judgments.softmax(list(result.option_logits))
+                )
+                active_job = None
+        except BaseException:
+            if active_job is not None:
+                self.app.backend.cancel(active_job)
+            raise
+        self._json(
+            200,
+            {
+                "model": self.app.model,
+                "answers": answers,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            },
+        )
+
+    def _systemone_error(self, error):
+        if self._response_started:
+            return
+        self._log_api_error(
+            APIError(422, error.details[0]["msg"], "unprocessable_entity")
+        )
+        try:
+            self._json(422, {"detail": error.details})
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass
 
     def _next_event(self, job, on_idle=None):
         while True:
@@ -895,17 +1107,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _sse(self, payload):
         data = (
-            payload
+            payload.encode("utf-8")
             if isinstance(payload, str)
-            else json.dumps(payload, separators=(",", ":"))
+            else json_codec.encode(payload)
         )
-        self.wfile.write(f"data: {data}\n\n".encode())
+        self.wfile.write(b"data: " + data + b"\n\n")
         self.wfile.flush()
         self._last_sse_write = time.monotonic()
 
     def _responses_sse(self, event, payload):
-        data = json.dumps(payload, separators=(",", ":"))
-        self.wfile.write(f"event: {event}\ndata: {data}\n\n".encode())
+        data = json_codec.encode(payload)
+        self.wfile.write(f"event: {event}\ndata: ".encode() + data + b"\n\n")
         self.wfile.flush()
         self._last_sse_write = time.monotonic()
 
@@ -1342,36 +1554,85 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
 
 class HttpAdmission:
-    """Nonwaiting request-capacity gate."""
+    """Nonwaiting capacity gate, in request counts or input bytes."""
 
     def __init__(self, capacity):
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
             raise ValueError("HTTP admission capacity must be a positive integer")
         self.capacity = capacity
         self.active = 0
-        self.lock = threading.Lock()
+        # Input finalizers can run during a stats snapshot on this thread.
+        self.lock = threading.RLock()
         self.idle = threading.Event()
         self.idle.set()
 
-    def acquire(self):
+    def acquire(self, amount=1):
         with self.lock:
-            if self.active == self.capacity:
+            if self.active + amount > self.capacity:
                 return False
-            self.active += 1
+            self.active += amount
             self.idle.clear()
             return True
 
-    def release(self):
+    def release(self, amount=1):
         with self.lock:
-            if self.active == 0:
+            if amount > self.active:
                 raise RuntimeError("HTTP admission slot released without acquisition")
-            self.active -= 1
+            self.active -= amount
             if self.active == 0:
                 self.idle.set()
 
     def stats(self):
         with self.lock:
             return {"active": self.active, "capacity": self.capacity}
+
+
+class RequestBodyReservation:
+    """Account input bytes until preparation and any retained input are released."""
+
+    def __init__(self, admission, size):
+        if not admission.acquire(size):
+            raise APIError(
+                503,
+                "request body capacity is exhausted; retry shortly",
+                "frontend_overloaded",
+            )
+        self.admission = admission
+        self.size = size
+
+    def release(self):
+        self.admission.release(self.size)
+        self.size = 0
+
+    def grow(self, size):
+        if not self.admission.acquire(size):
+            raise APIError(
+                503,
+                "retained input capacity is exhausted; retry shortly",
+                "frontend_overloaded",
+            )
+        self.size += size
+
+    def retain_for(self, job):
+        # Generation retains schemas and, for Responses, conversation history.
+        # Text/image prompts have otherwise become tokens and prepared pixels.
+        policy = job.tool_policy
+        retained = (
+            job.response_history_items,
+            job.response_format,
+            policy.schemas if policy else None,
+            policy.namespaces if policy else None,
+            job.stop_sequences,
+        )
+        retained = [value for value in retained if value]
+        size = json_codec.encoded_size(retained) if retained else 0
+        if size > self.size:
+            self.grow(size - self.size)
+        else:
+            self.admission.release(self.size - size)
+        self.size = size
+        if size:
+            weakref.finalize(job, self.release)
 
 
 class FrontendServer(ThreadingHTTPServer):
@@ -1392,9 +1653,20 @@ class FrontendServer(ThreadingHTTPServer):
         allowed_hosts=(),
         api_key=None,
         webui=True,
+        max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
     ):
         if not is_finite_number(io_timeout) or io_timeout <= 0:
             raise ValueError("io_timeout must be positive and finite")
+        if (
+            isinstance(max_request_bytes, bool)
+            or not isinstance(max_request_bytes, int)
+            or max_request_bytes <= 0
+        ):
+            raise ValueError("max_request_bytes must be a positive integer")
+        self.max_request_bytes = max_request_bytes
+        self.request_bodies = HttpAdmission(
+            max(DEFAULT_REQUEST_BODY_BUDGET, 2 * max_request_bytes)
+        )
         self.io_timeout = io_timeout
         self.api_key = validate_api_key(api_key) if api_key is not None else None
         self.webui = webui
@@ -1425,6 +1697,8 @@ class FrontendServer(ThreadingHTTPServer):
         }
         status["http"] = {
             "requests": self.requests.stats(),
+            "request_body_bytes": self.request_bodies.stats(),
+            "max_request_bytes": self.max_request_bytes,
             "token_counts": self.token_counts.stats(),
             "connections": self.connections.stats(),
         }
@@ -1525,6 +1799,13 @@ def _parse_max_memory(value):
     return result
 
 
+def _parse_request_size(value):
+    size = _parse_max_memory(value)
+    if size is None:
+        raise argparse.ArgumentTypeError("must be a positive byte count such as 128M")
+    return size
+
+
 def _parse_model_id(value):
     if value.count("/") != 1:
         raise argparse.ArgumentTypeError(
@@ -1547,6 +1828,13 @@ def parse_args(argv=None):
     )
     parser.add_argument("--max-context", type=_parse_max_context, default=None)
     parser.add_argument("--max-memory", type=_parse_max_memory, default=None)
+    parser.add_argument(
+        "--max-request-size",
+        type=_parse_request_size,
+        default=DEFAULT_MAX_REQUEST_BYTES,
+        help="maximum HTTP request body size (default: 128M); "
+        "shared input budget is max(512M, twice this limit)",
+    )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
     parser.add_argument("--max-new-tokens", type=int, default=32768)
     parser.add_argument("--request-timeout", type=float, default=1800)
@@ -1616,6 +1904,7 @@ def main():
             allowed_hosts=args.allowed_host,
             api_key=args.api_key,
             webui=not args.no_webui,
+            max_request_bytes=args.max_request_size,
         )
         server.server_bind()
         thinking_codec = ThinkingCodec(load_thinking_key())
