@@ -186,6 +186,12 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Q4Projection> projec
     weightsBefore.push_back(fingerprint(weights));
   }
   const auto plans = Q4Linear(backend.capabilities()).candidates(workload);
+  // A gate/up sweep mixing split-K and sequential plans computes the exact
+  // gate and up projections once per representative, outside the timing.
+  bool mixed = false;
+  for (const auto &plan : plans) mixed |= plan.partialSums() != plans.front().partialSums();
+  const uint64_t referenceSubmissions =
+      mixed && epilogue == LinearEpilogue::GateUp ? projections.size() : 0;
   const uint64_t before = backend.submissionCount();
   const uint64_t allocated = backend.memoryStats().allocatedBytes;
   size_t admissions = 0;
@@ -207,7 +213,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Q4Projection> projec
       "timed batch does not cover a bounded complete representative ring");
   require(result.measurements.size() + 1 == plans.size(), "candidate measurement missing");
   require(backend.submissionCount() - before == plans.size() * (projections.size() + 1) +
-      (plans.size() - 1) * 2 * (options.warmupPairs + options.samplePairs),
+      (plans.size() - 1) * 2 * (options.warmupPairs + options.samplePairs) + referenceSubmissions,
       "sweep did not time one full production command per invocation");
   require(backend.memoryStats().allocatedBytes == allocated, "fixture allocation leaked");
   for (size_t i = 0; i < projections.size(); ++i)
@@ -436,6 +442,17 @@ int main(int argc, char **argv) {
     std::array gate{projection(backend, {10240, 256}), projection(backend, {10240, 256}, 131)};
     for (uint32_t rows : {8U, 16U, 24U, 32U})
       gpuSweep(backend, gate, rows, LinearPhase::Decode, LinearEpilogue::GateUp);
+    // K % 1024 == 0 lists the split-K tiles beside the sequential ones (and
+    // selects one as the baseline on a GPU with two or more cores), so every
+    // qualification crosses the bitwise class and runs the derived bound.
+    std::array split{projection(backend, {512, 1024}), projection(backend, {512, 1024}, 131)};
+    bool mixedClasses = false;
+    for (const auto &plan : Q4Linear(backend.capabilities()).candidates({{512, 1024}, 8}))
+      mixedClasses |= plan.partialSums() > 1;
+    require(mixedClasses, "split-K candidates are missing for a K % 1024 == 0 workload");
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                               LinearEpilogue::GateUp})
+      gpuSweep(backend, split, 8, LinearPhase::Decode, epilogue);
     std::vector<Q4Projection> maximum;
     for (uint32_t i = 0; i < kMaximumLinearTuningRepresentatives; ++i)
       maximum.push_back(projection(backend, {512, 256}, 1009 + i));
