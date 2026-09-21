@@ -15,10 +15,10 @@ Apple9 one-lane MPP branches have been removed; those kernels remain useful
 as qualification references and offline candidates.
 
 Core count comes from the Metal device's IORegistry property. Missing metadata
-uses 40 cores for Apple9 and 20 for other families (Apple10 and later in the
-supported runtime), matching the M3 Max and M5 Pro reference devices. This is
-an estimate, not a performance guarantee for unidentified GPUs. A nonzero
-reported count always overrides it. Family 11 policy tests check extrapolation only: actual
+uses one 32-core estimate across families, an intermediate value in the
+16–40-core range of our reference machines. This is not a calibrated optimum
+or a performance guarantee for unidentified GPUs. A nonzero reported count
+always overrides it. Family 11 policy tests check extrapolation only: actual
 validation here covers families 9 and 10. Core count alone cannot describe
 memory bandwidth, cache capacity, power state or compiler behavior.
 
@@ -91,11 +91,9 @@ evidence directory. Earlier serving results remain in
 
 ## Unknown-core fallback follow-up
 
-After `e19a366`, the unmeasured universal 64-core assumption was replaced by
-the family-specific 40/20 reference sizes above. The convergence snapshot
-reported above describes the preceding cleanup; this follow-up intentionally
-changes unknown-core plans. Existing CPU policy tests cover unknown counts in
-both prefill and decode, and their expected family reference sizes. Known-core
-plans were compared separately before/after and remain byte-identical. No
-claim is made that a 16-core Apple10 GPU performs optimally if misidentified
-as the 20-core fallback; actual core discovery remains the normal path.
+The unknown-core path now uses a single 32-core estimate. The convergence
+snapshot reported above precedes this fallback change; unknown-core plans
+intentionally differ. Existing CPU policy tests cover unknown counts in both
+prefill and decode, including equivalence to an explicitly reported 32-core
+GPU. Known-core plans remain byte-identical in a separate before/after
+comparison. This fallback does not require startup or user-run calibration.

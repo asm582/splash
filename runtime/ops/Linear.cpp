@@ -331,11 +331,9 @@ constexpr uint32_t kWideDecodeTilesPerCore = 2;
 // Apple9 N256 prefill needs eight threadgroups per core to amortize its larger
 // tile. Apple10 selects four-simdgroup N128; that variant is unmeasured on Apple9.
 constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
-// Missing core metadata uses a tested reference size for each family:
-// M3 Max 40 for Apple9, M5 Pro 20 for Apple10 and later. These are estimates,
-// not optimal settings for every unidentified GPU. Reported counts win.
-constexpr uint32_t kAssumedApple9GpuCores = 40;
-constexpr uint32_t kAssumedApple10GpuCores = 20;
+// Missing core metadata uses one intermediate estimate for all families.
+// This is a fallback, not a calibrated optimum. Reported counts always win.
+constexpr uint32_t kAssumedGpuCores = 32;
 
 // Apple10 one-lane MPP policy, measured on 16/20-core GPUs. Split-K
 // fills narrow grids; wide plain projections reduce input re-reads with
@@ -369,8 +367,7 @@ std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t core
 
 Q4Linear::Q4Linear(const DeviceCapabilities &device) noexcept
     : appleGpuFamily_(device.appleGpuFamily),
-      gpuCores_(device.gpuCoreCount ? device.gpuCoreCount :
-          device.appleGpuFamily == 9 ? kAssumedApple9GpuCores : kAssumedApple10GpuCores) {}
+      gpuCores_(device.gpuCoreCount ? device.gpuCoreCount : kAssumedGpuCores) {}
 
 // GPU family selects variants; core count and workload tile counts determine
 // parallelism.

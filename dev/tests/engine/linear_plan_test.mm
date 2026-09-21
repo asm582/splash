@@ -226,7 +226,7 @@ void narrowM24BoundaryPlans() {
 void baselinePlans() {
   for (const uint32_t family : {9U, 10U, 11U}) {
     for (const uint32_t reportedCores : {0U, 10U, 16U, 18U, 20U, 40U, 80U}) {
-      const uint32_t cores = reportedCores ? reportedCores : (family == 9 ? 40U : 20U);
+      const uint32_t cores = reportedCores ? reportedCores : 32U;
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = reportedCores;
@@ -325,9 +325,9 @@ void baselinePlans() {
   require(configured(10, 16, gateUp) == LinearConfig{LinearTile::N256, 36} &&
               configured(10, 20, gateUp) == LinearConfig{LinearTile::N256, 48} &&
               configured(9, 40, gateUp) == LinearConfig{LinearTile::Simdgroup, 544, LinearSimdgroups::Four, 2} &&
-              // Unknown counts use the measured reference size for the family.
-              configured(10, 0, gateUp) == configured(10, 20, gateUp) &&
-              configured(9, 0, gateUp) == configured(9, 40, gateUp),
+              // Unknown counts use the same intermediate estimate on both families.
+              configured(10, 0, gateUp) == configured(10, 32, gateUp) &&
+              configured(9, 0, gateUp) == configured(9, 32, gateUp),
           "fused gate/up grid does not follow the balanced two-tile rule");
   // Apple9 scales single-lane K splits; wider batches retain their grids.
   require(configured(9, 16, gateUp) == LinearConfig{LinearTile::Simdgroup, 544, LinearSimdgroups::Four, 1} &&
@@ -407,7 +407,7 @@ void baselinePlans() {
               configured(10, 20, {{16640, 5120}, 32}) == LinearConfig{LinearTile::N256, 45} &&
               configured(10, 20, {{248320, 5120}, 16}) == LinearConfig{LinearTile::N128, 1940} &&
               configured(9, 20, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Simdgroup, 260, LinearSimdgroups::Four, 2} &&
-              configured(10, 0, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 70},
+              configured(10, 0, {{16640, 5120}, 8}) == configured(10, 32, {{16640, 5120}, 8}),
           "persistent decode groups changed for the measured shapes");
   require(configured(10, 16, {{14336, 5120}, 24}) ==
               LinearConfig{LinearTile::N128, 112, LinearSimdgroups::Four} &&
@@ -704,7 +704,7 @@ void scalingContracts() {
   for (uint32_t family : {9U, 10U, 11U}) {
     for (uint32_t index = 0; index <= 129; ++index) {
       const uint32_t reported = index == 129 ? 4096 : index;
-      const uint32_t cores = reported ? reported : (family == 9 ? 40U : 20U);
+      const uint32_t cores = reported ? reported : 32U;
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = reported;
