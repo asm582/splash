@@ -50,7 +50,14 @@ struct LinearMatrix final {
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
 enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
-enum class LinearTile : uint8_t { N128, N256, Paired128 };
+// Compute tiles over the StorageN=256 packing. Paired tiles pipeline two
+// quant groups of one lane. Split tiles keep one 8-row tile per threadgroup
+// and split K into four partitions whose fp32 partial sums are reduced before
+// the bf16 rounding; they take one lane, K % 1024 == 0 and one threadgroup
+// per tile. Paired256 is the four-simdgroup N256 paired tile.
+enum class LinearTile : uint8_t {
+  N128, N256, Paired128, Split32, Split64, Paired256
+};
 enum class LinearSimdgroups : uint8_t { Four = 4, Eight = 8 };
 
 struct LinearWorkload final {
@@ -65,7 +72,9 @@ struct LinearConfig final {
   LinearTile tile = LinearTile::N128;
   // Decode grid size. Prefill uses its matrix grid and requires zero here.
   uint32_t groups = 0;
-  // Cooperative execution scope, independent of the persistent grid size.
+  // Simdgroups per threadgroup, independent of the persistent grid size: the
+  // cooperative scope of one tile, or for split tiles the four partitions
+  // together (Split32 is 4 x 1, Split64 is 4 x 2; Paired256 runs four).
   LinearSimdgroups simdgroups = LinearSimdgroups::Eight;
   bool operator==(const LinearConfig &) const = default;
 };
@@ -82,6 +91,11 @@ public:
   [[nodiscard]] uint32_t storageRows() const noexcept;
   [[nodiscard]] uint32_t tileColumns() const noexcept;
   [[nodiscard]] uint32_t threadsPerThreadgroup() const noexcept;
+  // fp32 partial sums the kernel reduces before the single bf16 rounding of
+  // the projection: 1 for the sequential tiles, whose outputs are bitwise
+  // identical for a workload; 4 for split tiles, whose projection value lies
+  // within one bf16 ulp of theirs (the epilogue is applied after that).
+  [[nodiscard]] uint32_t partialSums() const noexcept;
   [[nodiscard]] uint64_t sumsBytes() const noexcept;
   [[nodiscard]] uint64_t gateScratchBytes() const noexcept;
   [[nodiscard]] uint64_t downSumsBytes() const noexcept;
