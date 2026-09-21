@@ -42,7 +42,7 @@ if __package__:
     from .constraints import ConstraintFactory, validate_tokenizer
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
-    from .frontend import Frontend
+    from .frontend import REASONING_EFFORTS, Frontend
     from .http_security import authenticate, validate_api_key, validate_headers
     from .latency import RequestLatency
     from .metrics import (
@@ -81,7 +81,7 @@ else:
     from constraints import ConstraintFactory, validate_tokenizer
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
-    from frontend import Frontend
+    from frontend import REASONING_EFFORTS, Frontend
     from http_security import authenticate, validate_api_key, validate_headers
     from latency import RequestLatency
     from metrics import is_finite_number, metrics_dict, prometheus_metrics, usage_dict
@@ -1826,6 +1826,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--model", type=_parse_model_id, required=True, metavar="OWNER/REPO"
     )
+    parser.add_argument(
+        "--default-reasoning-effort",
+        choices=REASONING_EFFORTS,
+        default=os.environ.get("SPLASH_DEFAULT_REASONING_EFFORT"),
+        help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
+    )
     parser.add_argument("--max-context", type=_parse_max_context, default=None)
     parser.add_argument("--max-memory", type=_parse_max_memory, default=None)
     parser.add_argument(
@@ -1846,6 +1852,13 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
     args = parser.parse_args(argv)
+    if (
+        args.default_reasoning_effort is not None
+        and args.default_reasoning_effort not in REASONING_EFFORTS
+    ):
+        parser.error(
+            "invalid --default-reasoning-effort / SPLASH_DEFAULT_REASONING_EFFORT"
+        )
     if args.api_key is not None:
         try:
             validate_api_key(args.api_key)
@@ -1951,6 +1964,7 @@ def main():
             constraint_factory,
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
+            default_reasoning_effort=args.default_reasoning_effort,
         )
         server.app = app
         server.server_activate()

@@ -68,6 +68,7 @@ else:
 
 
 PREPARATION_WAIT_SECONDS = 30.0
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 REASONING_EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
 
 
@@ -207,6 +208,7 @@ class Frontend:
         constraint_factory=None,
         max_image_pixels=image_input.MAX_PIXELS,
         thinking_codec=None,
+        default_reasoning_effort=None,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
@@ -214,6 +216,12 @@ class Frontend:
         self.tokenizer = tokenizer
         self.backend = backend
         self.model = model
+        if (
+            default_reasoning_effort is not None
+            and default_reasoning_effort not in REASONING_EFFORTS
+        ):
+            raise ValueError("invalid default_reasoning_effort")
+        self.default_reasoning_effort = default_reasoning_effort
         self.max_context = max_context
         self.default_max_new = default_max_new
         self.request_timeout = request_timeout
@@ -650,10 +658,11 @@ class Frontend:
         if body.get("model", self.model) != self.model:
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         reasoning_effort = body.get("reasoning_effort")
+        if reasoning_effort is None:
+            reasoning_effort = self.default_reasoning_effort
         if reasoning_effort is not None and (
             not isinstance(reasoning_effort, str)
-            or reasoning_effort
-            not in ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+            or reasoning_effort not in REASONING_EFFORTS
         ):
             raise APIError(400, "invalid reasoning_effort")
         preserve_thinking = body.get("preserve_thinking")

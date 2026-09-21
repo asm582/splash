@@ -522,6 +522,7 @@ class Harness:
         max_request_bytes=api.DEFAULT_MAX_REQUEST_BYTES,
         host="127.0.0.1",
         allowed_hosts=(),
+        **frontend_options,
     ):
         self.tokenizer = tokenizer or FakeTokenizer()
         runtime.pending_limit = queue_size
@@ -538,6 +539,7 @@ class Harness:
             2,
             constraint_factory,
             thinking_codec=thinking_codec,
+            **frontend_options,
         )
         self.server = api.FrontendServer(
             (host, 0),
@@ -3090,6 +3092,7 @@ class ServerTest(unittest.TestCase):
     def test_sigterm_uses_the_normal_main_cleanup_path(self):
         args = SimpleNamespace(
             target="target",
+            default_reasoning_effort=None,
             draft="draft",
             tokenizer="tokenizer",
             model="test-model",
@@ -3191,6 +3194,7 @@ class ServerTest(unittest.TestCase):
     def test_main_cleans_up_when_native_startup_fails_after_reserved_bind(self):
         args = SimpleNamespace(
             target="target",
+            default_reasoning_effort=None,
             draft="draft",
             tokenizer="tokenizer",
             model="test-model",
@@ -3237,6 +3241,7 @@ class ServerTest(unittest.TestCase):
     def test_main_rejects_port_conflict_before_loading_or_starting_native(self):
         args = SimpleNamespace(
             target="target",
+            default_reasoning_effort=None,
             draft="draft",
             tokenizer="tokenizer",
             model="test-model",
