@@ -1,6 +1,7 @@
 #include "metal/MetalBackend.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
+#include "ops/PagedAttention.hpp"
 #include "tuning/LinearNumerics.hpp"
 
 #include <algorithm>
@@ -163,11 +164,43 @@ void fusedNorm(metal::MetalBackend &backend, uint32_t k) {
   require(!std::memcmp(a.contents(),b.contents(),k*16),"fused operand permutation mismatch");
   require(!std::memcmp(sa.contents(),sb.contents(),k/2),"fused input sums mismatch");
 }
+void fusedAttentionGate(metal::MetalBackend &backend, uint32_t heads, uint32_t kvHeads) {
+  const uint32_t width = heads * 256, packedWidth = 2 * width + 2 * kvHeads * 256;
+  auto packed = backend.allocateBuffer(uint64_t{packedWidth} * 16);
+  auto attention = backend.allocateBuffer(uint64_t{width} * 32 * 2);
+  for (auto buffer : {packed, attention}) {
+    auto *data = static_cast<uint16_t *>(buffer.contents());
+    for (uint64_t i = 0; i < buffer.sizeBytes() / 2; ++i)
+      data[i] = floatToBf16(float(int(hash(uint32_t(i)) % 257) - 128) / 16);
+  }
+  Guarded output(backend, width * 16), fused(backend, width * 16);
+  Guarded a(backend, width * 16), b(backend, width * 16);
+  Guarded sa(backend, width / 2), sb(backend, width / 2);
+  metal::CommandGraph graph;
+  PagedAttention::addVerifyGate(graph, packed, attention, output.view, 8, 32, 32,
+                                heads, {1, kvHeads, 256}, 1);
+  graph.add("decode_linear_q4_prepare", {output.view, a.view, sa.view}, width,
+            {width / 32, 1, 1}, {128, 1, 1});
+  PagedAttention::addVerifyGate(graph, packed, attention, fused.view, 8, 32, 32,
+                                heads, {1, kvHeads, 256}, 1, {b.view, sb.view, {}, {}});
+  (void)backend.submitCommand(graph.dispatches());
+  require(!std::memcmp(output.view.contents(), fused.view.contents(), width * 16),
+          "fused attention gate output");
+  require(!std::memcmp(a.view.contents(), b.view.contents(), width * 16),
+          "fused attention gate table");
+  require(!std::memcmp(sa.view.contents(), sb.view.contents(), width / 2),
+          "fused attention gate sums");
+  for (auto *buffer : {&output, &fused, &a, &b, &sa, &sb}) buffer->check();
+}
+
+
 }
 int main(int argc,char **argv) {
   try {
     require(argc==2,"usage: q4-sgmatrix <production.metallib>");
     metal::MetalBackend backend(argv[1]);
+    fusedAttentionGate(backend, 24, 4);
+    fusedAttentionGate(backend, 16, 2);
     uint32_t cases=0;
     for (auto [n,k] : std::array<std::array<uint32_t,2>,4>{{{256,256},{768,768},{512,5120},{512,17408}}})
       for (uint32_t splits : {1U,2U,4U,8U}) {

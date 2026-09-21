@@ -460,7 +460,7 @@ void QwenTarget::addVerifyImpl(
                  buffers.gdnMixed[gdnIndex], mixer.decay, mixer.timeBias,
                  buffers.gdnDecay[gdnIndex], buffers.gdnBeta[gdnIndex],
                  buffers.recurrent, mixer.mixerNorm, buffers.gdnHidden,
-                 buffers.arrived, buffers.generation},
+                 buffers.arrived, buffers.generation, buffers.linearScratch},
                 geometry_.gdnShape(), lanes, gdnIndex,
                 {geometry_.stateLayout.convolutionLayerBytes(),
                  geometry_.stateLayout.recurrentLayerBytes(),
@@ -468,7 +468,7 @@ void QwenTarget::addVerifyImpl(
             operators_.linear().addResidualBatch(
                 graph, buffers.gdnHidden,
                 mixer.outputProjection, input, buffers.gdnOutput, mixerOutput,
-                lanes, stats, buffers.linearScratch);
+                lanes, stats, buffers.linearScratch, true);
             residual = buffers.gdnOutput;
             ++gdnIndex;
           } else {
@@ -494,11 +494,11 @@ void QwenTarget::addVerifyImpl(
                 graph, buffers.fullPacked, buffers.fullAttention,
                 buffers.attentionHidden, ExecutionLimits::targetVerifyRows,
                 tileRows, tileRows, geometry_.attentionQueryHeads,
-                geometry_.kvLayout, lanes);
+                geometry_.kvLayout, lanes, buffers.linearScratch);
             operators_.linear().addResidualBatch(
                 graph, buffers.attentionHidden,
                 mixer.outputProjection, input, buffers.attentionOutput,
-                mixerOutput, lanes, stats, buffers.linearScratch);
+                mixerOutput, lanes, stats, buffers.linearScratch, true);
             residual = buffers.attentionOutput;
             ++attentionIndex;
           }
