@@ -35,8 +35,12 @@ std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
   case LinearTile::Split32:
   case LinearTile::Paired256: return LinearSimdgroups::Four;
   case LinearTile::Split64: return LinearSimdgroups::Eight;
-  default: return std::nullopt;
+  case LinearTile::N128:
+  case LinearTile::N256:
+  case LinearTile::Paired128: return std::nullopt;
   }
+  return std::nullopt;
+
 }
 
 void validate(LinearWorkload w) {
@@ -92,10 +96,13 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
 // plain and residual projections, and the one-lane Split32 (plain, residual
 // and gate/up) and Paired256 (plain) tiles.
 bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
-  if (tile == LinearTile::Split32 || tile == LinearTile::Paired256)
+  if (tile == LinearTile::Split32)
+    return w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS;
+  // Only the affine paired N256 kernel is instantiated: this tile is used
+  // for wide plain projections; residual and gate/up retain their own tiles.
+  if (tile == LinearTile::Paired256)
     return w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS &&
-        (tile == LinearTile::Split32 ? w.epilogue != LinearEpilogue::UpWithGate
-                                     : w.epilogue == LinearEpilogue::None);
+        w.epilogue == LinearEpilogue::None;
   if (tile != LinearTile::N128) return false;
   return w.phase == LinearPhase::Prefill ||
       (w.rows == 24 && (w.epilogue == LinearEpilogue::None ||
@@ -114,8 +121,10 @@ uint32_t LinearPlan::tileColumns() const noexcept {
   case LinearTile::Split64: return 64;
   case LinearTile::N256:
   case LinearTile::Paired256: return 256;
-  default: return 128;
+  case LinearTile::N128:
+  case LinearTile::Paired128: return 128;
   }
+  return 0;
 }
 uint32_t LinearPlan::threadsPerThreadgroup() const noexcept {
   return static_cast<uint32_t>(config_.simdgroups) * 32;
@@ -188,6 +197,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
       throw std::invalid_argument("split Q4 tile requires K % 1024 == 0 and the full grid");
     const bool n32 = config.tile == LinearTile::Split32;
     if (w.epilogue == LinearEpilogue::GateUp) {
+      // Only the N32 two-stream split kernel is instantiated.
       if (!n32) throw std::invalid_argument("Q4 split gate/up requires Split32");
       pipeline_ = "decode_linear_q4_n32_split4_gate_up";
     } else if (residual) {
@@ -321,11 +331,12 @@ constexpr uint32_t kAssumedGpuCores = 64;
 //    four-simdgroup N256 groups, which halve the input re-reads of N128:
 //    Apple10 runs one resident wave of four groups per core (16 simdgroups,
 //    the knee); Apple9 keeps its full grids as everywhere else in decode.
-// Measured DRAM-cold against the sequential kernels: Apple9 40-core 27B
-// 5120-wide 1.34-1.35x (Split32), 14336/16640-wide 1.17-1.19x (Split64),
-// gate/up 17408 1.12x, lm_head 1.21x; 35B 2048-wide 1.66-1.79x. Apple10
-// 16/20-core: 2048-wide 1.63-1.98x (Split64), 5120-wide 0.99-1.13x, gate/up
-// 6144 1.09-1.11x, lm_head 1.01-1.08x.
+// The split32 knee band interpolates around 16 resident simdgroups; the
+// nearest sampled points outside the winning band were 6 and 28. The paired
+// N256 threshold is conservative: only the widest sampled projections crossed
+// eight tiles per core. These are measured policy bounds, not hardware limits.
+// The DRAM-cold sweep includes experimental paired-sg4 references; compare
+// against the shipped baseline plan when reporting production speedups.
 constexpr uint32_t kSplitTilesPerCoreApple10 = 1;
 constexpr uint32_t kSplitTilesPerCoreApple9 = 2;
 constexpr uint32_t kSplitGateUpTilesPerCore = 2;
@@ -349,7 +360,7 @@ std::optional<LinearConfig> oneLaneConfig(LinearWorkload w, uint32_t family,
   const uint32_t splitTilesPerCore =
       apple10 ? kSplitTilesPerCoreApple10 : kSplitTilesPerCoreApple9;
   if (splitK && tiles256 <= splitTilesPerCore * cores) {
-    const uint32_t split32SimdgroupsPerCore = (n / 32) * kSplitPartitions / cores;
+    const uint32_t split32SimdgroupsPerCore = (n / 32) * uint32_t(LinearSimdgroups::Four) / cores;
     const bool knee = !apple10 &&
         split32SimdgroupsPerCore >= kSplit32KneeSimdgroupsPerCoreMin &&
         split32SimdgroupsPerCore <= kSplit32KneeSimdgroupsPerCoreMax;

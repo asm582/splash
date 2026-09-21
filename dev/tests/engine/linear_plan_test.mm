@@ -49,9 +49,10 @@ float fp32(uint16_t value) {
   return std::bit_cast<float>(uint32_t{value} << 16);
 }
 
-// The device policy restated independently of Linear.cpp: rules over the GPU
-// family, the GPU core count and the workload's tile counts. A per-shape or
-// per-machine exception added to the operator must fail here.
+// Expected policy across GPU families, core counts and workload tile counts.
+// expectedGroups restates the group distribution independently; expectedOneLane
+// mirrors the one-lane rule. The literal anchors below independently guard
+// selected policy boundaries and production shapes.
 struct ExpectedConfig final {
   LinearTile tile;
   uint32_t groups;

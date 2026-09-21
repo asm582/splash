@@ -91,9 +91,9 @@ inline void q4_split(device bfloat *input, device uchar *weights,
                                       partials);                               \
   }
 
-// Threads per threadgroup = 4 partitions x Simdgroups x 32. A TileN=128
-// instance does not fit: 16 KB of partials plus the matmul2d scratch exceed
-// the 32 KB threadgroup memory limit.
+// Threads per threadgroup = 4 partitions x Simdgroups x 32. Only N32 and
+// N64 are instantiated: these are the tiles selected by the split policy.
+// A wider tile would require separate register-pressure and timing evidence.
 Q4_SPLIT_AFFINE(decode_linear_q4_n32_split4, 32, 1)        // 128 threads
 Q4_SPLIT_AFFINE(decode_linear_q4_n64_split4, 64, 2)        // 256 threads
 Q4_SPLIT_RESIDUAL(decode_linear_q4_n32_split4_residual, 32, 1)

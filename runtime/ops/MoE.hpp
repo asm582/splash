@@ -106,7 +106,7 @@ enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 // top_k=8, I=512), ms per layer at rows 8/16/24/32: gate/up
 // 0.332/0.551/0.728/0.859 -> 0.314/0.503/0.618/0.699 (1.06x-1.23x), down
 // 0.157/0.274/0.363/0.419 -> 0.137/0.226/0.297/0.335 (1.15x-1.25x). Apple10
-// variants stayed within noise of the shipped tiles (<= 1.07x), so family 10
+// variants had mixed results across shapes, so family 10
 // keeps eight. The 32-row tiles always run eight simdgroups. Either choice
 // writes bit-identical outputs and needs the same workspace; only the down
 // pass's column grid changes.
