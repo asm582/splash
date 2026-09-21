@@ -24,6 +24,7 @@ except ImportError:  # Executed directly by the source or packaged entry point.
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
 PORT = 8000
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 BASE_URL = f"http://127.0.0.1:{PORT}"
 
 
@@ -178,6 +179,12 @@ def serve(args):
             "--max-context",
             "auto" if args.max_context is None else str(args.max_context),
         ]
+        for name in args.served_model_name:
+            command.append(f"--served-model-name={name}")
+        if args.default_reasoning_effort is not None:
+            command.extend(
+                ["--default-reasoning-effort", args.default_reasoning_effort]
+            )
         if args.max_request_size is not None:
             command.extend(["--max-request-size", str(args.max_request_size)])
         if args.max_image_pixels is not None:
@@ -212,7 +219,7 @@ def coding_client(args):
     models = catalog.get("data", []) if isinstance(catalog, dict) else []
     if (
         not isinstance(models, list)
-        or len(models) != 1
+        or not models
         or not isinstance(models[0], dict)
         or models[0].get("owned_by") != "splash"
     ):
@@ -312,6 +319,18 @@ def _version():
     )
 
 
+def _parse_served_model_name(value):
+    if (
+        not value
+        or any(not c.isprintable() or c.isspace() or c in "\\%?#" for c in value)
+        or any(part in ("", ".", "..") for part in value.split("/"))
+    ):
+        raise argparse.ArgumentTypeError(
+            "model alias must be a non-empty name without whitespace or URL delimiters"
+        )
+    return value
+
+
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     client_args = []
@@ -343,6 +362,19 @@ def parse_args(argv=None):
         required=True,
         metavar="OWNER/REPO",
         help="Hugging Face repository containing a Splash package",
+    )
+    server.add_argument(
+        "--served-model-name",
+        action="append",
+        default=[],
+        type=_parse_served_model_name,
+        help="additional API model name; responses keep the loaded model ID (repeatable)",
+    )
+    server.add_argument(
+        "--default-reasoning-effort",
+        choices=REASONING_EFFORTS,
+        default=os.environ.get("SPLASH_DEFAULT_REASONING_EFFORT"),
+        help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
     )
     server.add_argument(
         "--max-memory",
@@ -380,6 +412,14 @@ def parse_args(argv=None):
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
+    if (
+        args.command == "serve"
+        and args.default_reasoning_effort is not None
+        and args.default_reasoning_effort not in REASONING_EFFORTS
+    ):
+        parser.error(
+            "invalid --default-reasoning-effort / SPLASH_DEFAULT_REASONING_EFFORT"
+        )
     if args.command in clients.INSTALL_URLS:
         try:
             args.port = _parse_port(os.environ.get("SPLASH_PORT", str(PORT)))

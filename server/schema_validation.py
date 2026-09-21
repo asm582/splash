@@ -1,6 +1,9 @@
 """JSON Schema validation with bounded regular-expression evaluation."""
 
 import copy
+import json
+import threading
+from collections import OrderedDict
 from functools import lru_cache
 
 import regex
@@ -70,7 +73,26 @@ def _bounded_class(base):
     )
 
 
+_VALIDATOR_CACHE_SIZE = 256
+_VALIDATOR_CACHE_SOURCE_BYTES = 8 * 1024 * 1024
+_validator_cache_lock = threading.Lock()
+_validator_cache = OrderedDict()
+_validator_cache_bytes = 0
+
+
 def build_validator(schema, nodes, registry):
+    global _validator_cache_bytes
+    # check_schema walks the whole JSON Schema meta-schema; tool and
+    # response_format schemas are the same on every turn of a conversation,
+    # so cache the built validator instead of re-validating and rebuilding it.
+    key = (id(nodes), id(registry), json.dumps(schema, sort_keys=True))
+    # json.dumps uses ASCII escapes, so character count equals source bytes.
+    source_bytes = len(key[2])
+    with _validator_cache_lock:
+        cached = _validator_cache.get(key)
+        if cached is not None:
+            _validator_cache.move_to_end(key)
+            return cached[2]
     base = validators.validator_for(schema)
     base.check_schema(schema)
     validated = copy.deepcopy(schema)
@@ -81,4 +103,24 @@ def build_validator(schema, nodes, registry):
             if validators.validator_for(node) is not base:
                 raise APIError(400, "mixed schema dialects are not supported")
             node.pop("$schema")
-    return _bounded_class(base)(validated, registry=registry)
+    validator = _bounded_class(base)(validated, registry=registry)
+    if source_bytes > _VALIDATOR_CACHE_SOURCE_BYTES:
+        return validator
+    with _validator_cache_lock:
+        # Another preparation thread may have filled the same miss.
+        cached = _validator_cache.get(key)
+        if cached is not None:
+            _validator_cache.move_to_end(key)
+            return cached[2]
+        # Retain both identity-keyed contexts while the entry is cached; their
+        # object IDs must not be recycled into an unrelated cache hit.
+        _validator_cache[key] = (nodes, registry, validator)
+        _validator_cache_bytes += source_bytes
+        _validator_cache.move_to_end(key)
+        while (
+            len(_validator_cache) > _VALIDATOR_CACHE_SIZE
+            or _validator_cache_bytes > _VALIDATOR_CACHE_SOURCE_BYTES
+        ):
+            evicted_key, _ = _validator_cache.popitem(last=False)
+            _validator_cache_bytes -= len(evicted_key[2])
+    return validator

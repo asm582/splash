@@ -52,8 +52,10 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-`model` is optional. If you set it, it must match the package you served.
-Reasoning is on by default. `"reasoning_effort": "none"` turns it off, and
+`model` is optional. If set, use the served package ID or a configured
+[model alias](DEVELOPMENT.md#api-model-aliases).
+Reasoning follows the model default unless a [server default](DEVELOPMENT.md#default-reasoning-effort)
+is configured. `"reasoning_effort": "none"` turns it off, and
 Qwen3.8-27B also takes `low`, `medium`, and `xhigh`.
 
 `/v1/judgments` and `/v1/systemone` provide scoring without generation.
