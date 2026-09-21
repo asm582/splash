@@ -2,12 +2,15 @@
 
 #include "ops/Linear.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 // bf16 arithmetic and the split-K tolerance shared by the tuner's candidate
-// qualification and the Q4 kernel tests. Header-only, no Metal dependency.
+// qualification and the Q4 kernel tests. Operand bounds use CPU-visible
+// buffers and do not submit GPU work.
 namespace splash::ops::tuning {
 
 inline float bf16ToFloat(uint16_t value) noexcept {
@@ -57,6 +60,41 @@ inline float reassociationSlack(uint32_t inputSize, float maxAbsReference) noexc
   return float(inputSize / 64) * std::ldexp(std::fabs(maxAbsReference), -24);
 }
 
+// Bound the magic-offset kernel's fp32 error using operand magnitudes, not
+// the (possibly cancelling) output. For each group, gamma(72)*143 covers
+// 64 products plus row-sum/correction rounding; gamma(2G+8) covers the two
+// affine FMAs per group and up to eight split additions. Maxima over columns
+// keep this qualification pass linear in packed metadata, not matrix FLOPs.
+inline float simdgroupSlack(LinearWorkload w, const metal::MetalBuffer &input,
+                           const Q4Projection &projection) {
+  const uint32_t groups = w.matrix.inputSize / 64;
+  std::vector<double> scale(groups), bias(groups);
+  const auto *sc = static_cast<const uint16_t *>(projection.scales.contents());
+  const auto *bi = static_cast<const uint16_t *>(projection.biases.contents());
+  for (uint32_t n = 0; n < w.matrix.outputSize; ++n)
+    for (uint32_t g = 0; g < groups; ++g) {
+      const uint64_t i = (uint64_t(n / 256) * groups + g) * 256 + n % 256;
+      scale[g] = std::max(scale[g], double(std::fabs(bf16ToFloat(sc[i]))));
+      bias[g] = std::max(bias[g], double(std::fabs(bf16ToFloat(bi[i]))));
+    }
+  constexpr double u = 0x1p-24;
+  const auto gamma = [&](double n) { return n * u / (1 - n * u); };
+  const auto *x = static_cast<const uint16_t *>(input.contents());
+  double bound = 0;
+  for (uint32_t row = 0; row < w.rows; ++row) {
+    double quant = 0, affine = 0;
+    for (uint32_t g = 0; g < groups; ++g) {
+      double absolute = 0;
+      for (uint32_t k = 0; k < 64; ++k)
+        absolute += std::fabs(bf16ToFloat(x[uint64_t(row) * w.matrix.inputSize + g * 64 + k]));
+      quant += absolute * scale[g];
+      affine += absolute * (15 * scale[g] + bias[g]);
+    }
+    bound = std::max(bound, gamma(72) * 143 * quant + gamma(2 * groups + 8) * affine);
+  }
+  return float(bound);
+}
+
 // Largest |actual - reference.value| a split-K output may show. Two roundings
 // of values that differ by fp32 noise straddle at most one bf16 spacing, so
 // the projection p differs by at most ulp(p) + slack. The epilogue then
@@ -74,7 +112,7 @@ inline float splitTolerance(LinearEpilogue epilogue, SplitReference reference,
   if (epilogue == LinearEpilogue::Residual)
     bound += ulpBf16(reference.value - reference.residual);
   if (epilogue == LinearEpilogue::GateUp)
-    bound += 1.1f * std::fabs(reference.up) * (ulpBf16(reference.gate) + slack) +
+    bound += 1.1f * (std::fabs(reference.up) + ulpBf16(reference.up) + slack) * (ulpBf16(reference.gate) + slack) +
         std::fabs(silu(reference.gate)) * (ulpBf16(reference.up) + slack);
   return bound;
 }

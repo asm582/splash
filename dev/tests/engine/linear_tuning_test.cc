@@ -189,7 +189,8 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Q4Projection> projec
   // A gate/up sweep mixing split-K and sequential plans computes the exact
   // gate and up projections once per representative, outside the timing.
   bool mixed = false;
-  for (const auto &plan : plans) mixed |= plan.partialSums() != plans.front().partialSums();
+  for (const auto &plan : plans) mixed |= plan.partialSums() != plans.front().partialSums() ||
+      plan.usesSimdgroup() || plans.front().usesSimdgroup();
   const uint64_t referenceSubmissions =
       mixed && epilogue == LinearEpilogue::GateUp ? projections.size() : 0;
   const uint64_t before = backend.submissionCount();
@@ -331,6 +332,11 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
       allocate(epilogue == LinearEpilogue::Residual ?
           uint64_t{baseline.storageRows()} * workload.matrix.outputSize * 2 : 0),
       allocate(baseline.gateScratchBytes()), allocate(baseline.downSumsBytes())};
+  const auto scratch = baseline.scratchSize();
+  buffers.scratch = {allocate(scratch.input), allocate(scratch.sums),
+                     allocate(scratch.partials), allocate(scratch.counters)};
+  if (buffers.scratch.counters)
+    std::memset(buffers.scratch.counters.contents(), 0, scratch.counters);
   const auto fill = [&](const metal::MetalBuffer &buffer, uint32_t width, uint32_t seed) {
     auto *values = static_cast<uint16_t *>(buffer.contents());
     for (uint64_t i = 0; i < buffer.sizeBytes() / 2; ++i)
@@ -374,11 +380,11 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
   const auto immutableResidual = snapshot(buffers.residual);
   for (uint32_t repetitions : {1U, uint32_t(projections.size()), 16U}) {
     const uint32_t last = (repetitions - 1) % projections.size();
-    (void)invoke(baseline, last, 1);
-    const auto expected = snapshot(buffers.output);
-    const auto expectedSums = snapshot(buffers.downSums);
-    const auto expectedGate = snapshot(buffers.gateScratch);
     for (const auto &plan : plans) {
+      (void)invoke(plan, last, 1);
+      const auto expected = snapshot(buffers.output);
+      const auto expectedSums = snapshot(buffers.downSums);
+      const auto expectedGate = snapshot(buffers.gateScratch);
       (void)invoke(plan, 0, repetitions);
       require(same(buffers.output, expected) && same(buffers.downSums, expectedSums),
               "repeated whole operator differs from isolated last representative");
