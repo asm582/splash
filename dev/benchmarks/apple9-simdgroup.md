@@ -27,10 +27,13 @@ each completed dispatch. Startup choices reserve the maximum of the default
 and selected plans. No scratch allocation occurs while encoding a projection.
 
 RMSNorm writes its ordinary output and the matrix operand layout from the same
-rounded bfloat values. Its next Q4 consumer marks the input prepared. Other
-producers use a separate preparation dispatch. Reused draft head/selector and
+rounded bfloat values. Its next Q4 consumer marks the input prepared. GDN and the attention gate also emit
+the prepared layout from their rounded output. The FFN gate/up producer still
+uses a separate preparation dispatch. Reused draft head/selector and
 context inputs share their prepared table until another producer overwrites it.
-This keeps the integration limited to one producer and the Q4 operator.
+Producer fusion reuses the same arena buffers and does not change Q4 weights.
+See [remaining-decode-optimizations.md](remaining-decode-optimizations.md) for the
+follow-up measurements and rejected experiments.
 
 ## Validation
 
