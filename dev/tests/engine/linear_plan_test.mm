@@ -419,19 +419,28 @@ void baselinePlans() {
           "one-lane pipelining or prefill tile rule changed for the measured shapes");
 }
 
-void planContracts() {
+// `widestCandidates` accumulates the largest candidate set seen, so main() can
+// check that the bound below is reached and not merely respected.
+void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   DeviceCapabilities device;
-  device.appleGpuFamily = 9;
+  device.appleGpuFamily = family;
+  device.gpuCoreCount = cores;
   Q4Linear linear(device);
+  // 23040 is 90 tiles of 256: above the split-K bound and below the paired
+  // N256 bound of a 16-core Apple10 GPU, so its one-lane plain baseline is a
+  // Paired128 group count of its own and every one-lane candidate is listed
+  // beside it. That is the widest candidate set the operator can produce.
   for (const LinearMatrix matrix : {LinearMatrix{512, 256}, LinearMatrix{768, 768},
-                                    LinearMatrix{16640, 5120}, LinearMatrix{12544, 2048}}) {
+                                    LinearMatrix{16640, 5120}, LinearMatrix{12544, 2048},
+                                    LinearMatrix{23040, 2048}}) {
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                  LinearEpilogue::GateUp}) {
         const LinearWorkload workload{matrix, lanes * 8, LinearPhase::Decode, epilogue};
         const auto candidates = linear.candidates(workload);
-        require(!candidates.empty() && candidates.size() <= 16,
+        require(!candidates.empty() && candidates.size() <= Q4Linear::kMaximumCandidates,
                 "Linear candidates exceed the bounded set");
+        widestCandidates = std::max(widestCandidates, candidates.size());
         require(candidates.front().configuration() == linear.plan(workload).configuration(),
                 "Linear baseline is not first candidate");
         uint32_t fourScopeCandidates = 0, splitCandidates = 0;
@@ -1065,7 +1074,13 @@ int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     baselinePlans();
-    planContracts();
+    // Apple9 at the assumed core count and the small Apple10 GPU that produces
+    // the widest candidate set.
+    size_t widestCandidates = 0;
+    planContracts(9, 0, widestCandidates);
+    planContracts(10, 16, widestCandidates);
+    require(widestCandidates == Q4Linear::kMaximumCandidates,
+            "no covered workload reaches the Linear candidate bound");
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";
       return 0;

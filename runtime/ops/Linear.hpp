@@ -3,8 +3,9 @@
 #include "metal/DeviceCapabilities.hpp"
 #include "metal/CommandGraph.hpp"
 
-#include <cstdint>
 #include <compare>
+#include <cstddef>
+#include <cstdint>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -135,6 +136,15 @@ struct Q4DispatchStats final {
 class Q4Linear final {
 public:
   explicit Q4Linear(const DeviceCapabilities &device) noexcept;
+
+  // Widest candidate set any workload produces: the baseline, then up to four
+  // group counts for each of N128, N256 and Paired128 (the four-simdgroup
+  // variants exist only at three lanes, where Paired128 is excluded, so they
+  // replace that tile's entries rather than add a fourth tile), and for one
+  // lane the two split tiles plus the paired N256 tile at its resident wave
+  // and at its full grid. 1 + 3 * 4 + 4 = 17, reached by a one-lane plain
+  // projection whose baseline is a Paired128 group count of its own.
+  static constexpr std::size_t kMaximumCandidates = 17;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   [[nodiscard]] static LinearPlan plan(LinearWorkload workload, LinearConfig config);

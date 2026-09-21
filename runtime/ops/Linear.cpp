@@ -440,7 +440,7 @@ void Q4Linear::setChoices(std::span<const LinearChoice> choices) {
 
 std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
   std::vector<LinearPlan> result;
-  result.reserve(16);
+  result.reserve(kMaximumCandidates);
   result.push_back(LinearPlan(w, baseline(w)));
   const auto append = [&](LinearConfig config) {
     for (const auto &existing : result)
