@@ -477,7 +477,7 @@
     }
     if (delta.content) {
       assistant.content += delta.content;
-      box.querySelector('.content').textContent = assistant.content;
+      box.querySelector('.content').textContent = assistant.content.trim();
     }
     scrollTo(0, document.body.scrollHeight);
     return false;
