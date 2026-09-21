@@ -448,9 +448,14 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
   }
   // Pipelined N128 hides the latency of a single lane's weight stream.
   if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, kN128Groups)};
+  // With at most one N128 tile per core, longer M24 dot products benefit
+  // from eight groups. Short K and wider grids retain the four-group path.
+  if (appleGpuFamily_ >= 10 && lanes == 3 && tiles128 <= gpuCores_ &&
+      w.matrix.inputSize >= 4096)
+    return {LinearTile::N128, tiles128, LinearSimdgroups::Eight};
   // M24 plain projections benefit from four SIMD groups on Apple9 too.
   // Apple9 residual projections retain eight groups with compact prefix
-  // traversal; Apple10 uses four groups for both epilogues.
+  // traversal; Apple10 uses four groups outside the narrow-grid case above.
   if (lanes == 3 && (appleGpuFamily_ >= 10 ||
       (appleGpuFamily_ == 9 && w.epilogue == LinearEpilogue::None)))
     return {LinearTile::N128, groups(tiles128, kFourSimdgroupGroups),

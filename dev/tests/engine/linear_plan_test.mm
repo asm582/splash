@@ -147,6 +147,8 @@ ExpectedConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matr
     return {LinearTile::N256, std::min(tiles256, uint32_t(std::lround(2.25 * cores)))};
   }
   if (lanes == 1) return {LinearTile::Paired128, groups(tiles128, n128)};
+  if (family >= 10 && lanes == 3 && tiles128 <= cores && matrix.inputSize >= 4096)
+    return {LinearTile::N128, tiles128, LinearSimdgroups::Eight};
   if (lanes == 3 && (family >= 10 ||
       (family == 9 && epilogue == LinearEpilogue::None)))
     return {LinearTile::N128, groups(tiles128, fourSimdgroups), LinearSimdgroups::Four};
@@ -210,6 +212,26 @@ constexpr std::array kProductionShapes{
     ProductionShape{{5120, 4352}, LinearEpilogue::Residual},
     ProductionShape{{6144, 4352}, LinearEpilogue::GateUp},
     ProductionShape{{2048, 768}, LinearEpilogue::None}};
+
+void narrowM24BoundaryPlans() {
+  for (uint32_t cores : {16U, 20U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = 10;
+    device.gpuCoreCount = cores;
+    Q4Linear linear(device);
+    for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual}) {
+      // Explicit values on both sides of the tile and K boundaries.
+      for (auto [matrix, threads] : std::array<std::pair<LinearMatrix, uint32_t>, 4>{{
+               {{cores * 128, 4096}, 256}, {{cores * 128 + 256, 4096}, 128},
+               {{cores * 128, 3840}, 128}, {{256, 16384}, 256}}}) {
+        const auto plan = linear.plan({matrix, 24, LinearPhase::Decode, epilogue});
+        require(plan.threadsPerThreadgroup() == threads &&
+                    plan.configuration().groups == matrix.outputSize / 128,
+                "narrow M24 occupancy boundary changed");
+      }
+    }
+  }
+}
 
 void baselinePlans() {
   constexpr uint32_t assumedCores = 64;  // policy default when the count is unknown
@@ -1120,6 +1142,7 @@ int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     baselinePlans();
+    narrowM24BoundaryPlans();
     // Apple9 at the assumed core count and the small Apple10 GPU that produces
     // the widest candidate set.
     size_t widestCandidates = 0;
