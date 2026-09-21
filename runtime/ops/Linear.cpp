@@ -16,6 +16,7 @@ namespace {
 
 constexpr uint32_t kPrefillRows = 32;
 constexpr uint32_t kQuantGroup = 64;
+constexpr uint32_t kMaximumSimdgroupSplits = 8;
 // Split tiles hold four K partitions, each a whole number of the kernels'
 // four-quant-group (256-input) input-sum blocks.
 constexpr uint32_t kSplitPartitions = 4;
@@ -41,7 +42,6 @@ std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
   case LinearTile::Paired128: return std::nullopt;
   }
   return std::nullopt;
-
 }
 
 void validate(LinearWorkload w) {
@@ -205,7 +205,7 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
   if (usesSimdgroup()) {
     const uint32_t groups = w.matrix.inputSize / kQuantGroup;
     if (config.groups != w.matrix.outputSize / tileColumns() ||
-        !config.splits || config.splits > 8 || (config.splits & (config.splits - 1)) ||
+        !config.splits || config.splits > kMaximumSimdgroupSplits || (config.splits & (config.splits - 1)) ||
         groups % config.splits)
       throw std::invalid_argument("simdgroup Q4 requires full column grid and whole power-of-two K partitions");
     pipeline_ = w.epilogue == LinearEpilogue::GateUp ? "decode_linear_q4_sg_gate_up" :
@@ -331,69 +331,34 @@ constexpr uint32_t kWideDecodeTilesPerCore = 2;
 // Apple9 N256 prefill needs eight threadgroups per core to amortize its larger
 // tile. Apple10 selects four-simdgroup N128; that variant is unmeasured on Apple9.
 constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
-// Without a core count the policy assumes a large GPU, so every rule picks
-// the configuration with more threadgroups, which is the safe direction.
+// Missing device metadata uses a fixed fallback with broad parallelism.
+// It preserves valid grids but is not a calibrated performance optimum.
 constexpr uint32_t kAssumedGpuCores = 64;
 
-// One lane (rows == 8) streams one weight tile per threadgroup. A core needs
-// 16 resident simdgroups (the 512-thread occupancy knee) to stream weights at
-// full rate, and a projection with about as many 256-wide tiles as the GPU
-// has cores gives each core one or two sequential tiles. Split-K keeps the
-// tile and gives it four K partitions, so a Split64 tile is eight simdgroups
-// and a Split32 tile four; the bounds below are in 256-wide tiles per core.
-//  - Apple10, with the per-core matrix unit, hides a tile's latency at two
-//    128-thread groups per core: split-K pays up to one tile per core and
-//    above that the sequential grid streams faster (0.84-0.95x measured).
-//  - Apple9 is latency-bound at low occupancy: split-K pays up to two tiles
-//    per core. Its 128-thread Split32 grid wins while that grid alone sits at
-//    the knee band, 12 to 24 simdgroups per core; below it there are too few
-//    threadgroups, above it the fewer, larger 256-thread Split64 groups win.
-//  - Gate/up streams two weights per tile, which halves the effective tiles
-//    per core, so split-K pays up to two tiles per core on both families.
-//  - From eight 256-wide tiles per core a plain projection is wide enough for
-//    four-simdgroup N256 groups, which halve the input re-reads of N128:
-//    Apple10 runs one resident wave of four groups per core (16 simdgroups,
-//    the knee); Apple9 keeps its full grids as everywhere else in decode.
-// The split32 knee band interpolates around 16 resident simdgroups; the
-// nearest sampled points outside the winning band were 6 and 28. The paired
-// N256 threshold is conservative: only the widest sampled projections crossed
-// eight tiles per core. These are measured policy bounds, not hardware limits.
-// The DRAM-cold sweep includes experimental paired-sg4 references; compare
-// against the shipped baseline plan when reporting production speedups.
+// Apple10 one-lane MPP policy, measured on 16/20-core GPUs. Split-K
+// fills narrow grids; wide plain projections reduce input re-reads with
+// paired N256 tiles at one resident wave. These are performance thresholds,
+// not kernel limits. Apple9 uses the separate simdgroup policy below.
 constexpr uint32_t kSplitTilesPerCoreApple10 = 1;
-constexpr uint32_t kSplitTilesPerCoreApple9 = 2;
 constexpr uint32_t kSplitGateUpTilesPerCore = 2;
-constexpr uint32_t kSplit32KneeSimdgroupsPerCoreMin = 12;
-constexpr uint32_t kSplit32KneeSimdgroupsPerCoreMax = 24;
 constexpr uint32_t kPaired256TilesPerCore = 8;
 constexpr uint32_t kPaired256WaveGroupsPerCore = 4;
 
-std::optional<LinearConfig> oneLaneConfig(LinearWorkload w, uint32_t family,
-                                          uint32_t cores) {
+std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t cores) {
   // validate() requires outputSize % 256 == 0, so every tile width divides it.
   const uint32_t n = w.matrix.outputSize;
   const uint32_t tiles256 = n / 256;
   const bool splitK = w.matrix.inputSize % kSplitInputBlock == 0;
-  const bool apple10 = family >= 10;
   if (w.epilogue == LinearEpilogue::GateUp) {
     if (splitK && tiles256 <= kSplitGateUpTilesPerCore * cores)
       return LinearConfig{LinearTile::Split32, n / 32, LinearSimdgroups::Four};
     return std::nullopt;
   }
-  const uint32_t splitTilesPerCore =
-      apple10 ? kSplitTilesPerCoreApple10 : kSplitTilesPerCoreApple9;
-  if (splitK && tiles256 <= splitTilesPerCore * cores) {
-    const uint32_t split32SimdgroupsPerCore = (n / 32) * uint32_t(LinearSimdgroups::Four) / cores;
-    const bool knee = !apple10 &&
-        split32SimdgroupsPerCore >= kSplit32KneeSimdgroupsPerCoreMin &&
-        split32SimdgroupsPerCore <= kSplit32KneeSimdgroupsPerCoreMax;
-    if (knee) return LinearConfig{LinearTile::Split32, n / 32, LinearSimdgroups::Four};
+  if (splitK && tiles256 <= kSplitTilesPerCoreApple10 * cores)
     return LinearConfig{LinearTile::Split64, n / 64, LinearSimdgroups::Eight};
-  }
   if (w.epilogue == LinearEpilogue::None && tiles256 >= kPaired256TilesPerCore * cores)
     return LinearConfig{LinearTile::Paired256,
-                        apple10 ? std::min(tiles256, kPaired256WaveGroupsPerCore * cores)
-                                : tiles256,
+                        std::min(tiles256, kPaired256WaveGroupsPerCore * cores),
                         LinearSimdgroups::Four};
   return std::nullopt;
 }
@@ -426,13 +391,13 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
     uint32_t splits = 1;
     // Aim for sixteen independent column/K groups per core, retaining at
     // least twelve quant groups per partition to amortize the reduction.
-    while (splits < 8 && uint64_t(grid) * splits < 16ULL * gpuCores_ &&
+    while (splits < kMaximumSimdgroupSplits && uint64_t(grid) * splits < 16ULL * gpuCores_ &&
            groups % (2 * splits) == 0 && groups / (2 * splits) >= 12)
       splits *= 2;
     return {LinearTile::Simdgroup, grid, LinearSimdgroups::Four, splits};
   }
-  if (lanes == 1)
-    if (const auto config = oneLaneConfig(w, appleGpuFamily_, gpuCores_)) return *config;
+  if (appleGpuFamily_ >= 10 && lanes == 1)
+    if (const auto config = apple10OneLaneConfig(w, gpuCores_)) return *config;
   // Apple9 keeps its one-tile grids (see kApple9GateUpGroupsPerCore).
   const auto groups = [&](uint32_t tiles, DecodeGroupPolicy policy) {
     return appleGpuFamily_ >= 10 ? decodeGroups(tiles, gpuCores_, policy)
@@ -513,7 +478,10 @@ std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
         append({tile, 0, LinearSimdgroups::Four});
     } else {
       const uint32_t tiles = w.matrix.outputSize / columns;
-      for (const uint32_t groups : {36U, 60U, 80U, tiles}) {
+      // Sample two, three and four groups per core plus the full grid.
+      // Always retain the measured baseline above, including its balanced
+      // group count. Fixed counts tied to one GPU miss these waves elsewhere.
+      for (const uint32_t groups : {2 * gpuCores_, 3 * gpuCores_, 4 * gpuCores_, tiles}) {
         append({tile, std::min(groups, tiles)});
         if (supportsFourSimdgroups(w, tile))
           append({tile, std::min(groups, tiles), LinearSimdgroups::Four});
@@ -524,6 +492,12 @@ std::vector<LinearPlan> Q4Linear::candidates(LinearWorkload w) const {
   // tile at one resident wave and at its full grid.
   if (w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS) {
     const uint32_t n = w.matrix.outputSize;
+    if (appleGpuFamily_ == 9) {
+      const uint32_t columns = w.epilogue == LinearEpilogue::GateUp ? 32 : 64;
+      for (uint32_t splits = 1; splits <= kMaximumSimdgroupSplits; splits *= 2)
+        if ((w.matrix.inputSize / kQuantGroup) % splits == 0)
+          append({LinearTile::Simdgroup, n / columns, LinearSimdgroups::Four, splits});
+    }
     if (w.matrix.inputSize % kSplitInputBlock == 0) {
       append({LinearTile::Split32, n / 32, LinearSimdgroups::Four});
       if (w.epilogue != LinearEpilogue::GateUp)

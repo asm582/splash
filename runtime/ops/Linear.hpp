@@ -160,14 +160,12 @@ class Q4Linear final {
 public:
   explicit Q4Linear(const DeviceCapabilities &device) noexcept;
 
-  // Widest candidate set any workload produces: the baseline, then up to four
-  // group counts for each of N128, N256 and Paired128 (the four-simdgroup
-  // variants exist only at three lanes, where Paired128 is excluded, so they
-  // replace that tile's entries rather than add a fourth tile), and for one
-  // lane the two split tiles plus the paired N256 tile at its resident wave
-  // and at its full grid. 1 + 3 * 4 + 4 = 17, reached by a one-lane plain
-  // projection whose baseline is a Paired128 group count of its own.
-  static constexpr std::size_t kMaximumCandidates = 17;
+  // One lane: at most 3 tiles * 4 group counts, 2 split tiles, 2 paired
+  // N256 grids, and 4 Apple9 simdgroup K splits (including its baseline):
+  // 3 * 4 + 2 + 2 + 4 = 20. Other families have no simdgroup candidates
+  // and at most one additional baseline (17). M24 replaces Paired128 with
+  // N128/four-simdgroup candidates, and has no one-lane tiles (at most 13).
+  static constexpr std::size_t kMaximumCandidates = 20;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
@@ -222,7 +220,7 @@ public:
                         metal::MetalBuffer residual,
                         metal::MetalBuffer output, LinearMatrix matrix,
                         uint32_t lanes, Q4DispatchStats &stats,
-                      LinearScratch scratch = {}, bool inputPrepared = false) const;
+                        LinearScratch scratch = {}, bool inputPrepared = false) const;
 
 private:
   [[nodiscard]] LinearConfig baseline(LinearWorkload workload) const;

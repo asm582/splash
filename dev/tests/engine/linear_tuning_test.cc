@@ -43,7 +43,8 @@ void cpuContracts() {
                   "fixture does not cover input/output/reference or physical alignment");
           for (const auto &plan : plans)
             require(bytes >= base + plan.sumsBytes() + plan.gateScratchBytes() +
-                2 * plan.downSumsBytes(), "fixture misses a candidate workspace");
+                2 * plan.downSumsBytes() + plan.scratchSize().bytes(),
+                "fixture misses a candidate workspace");
           auto denied = device;
           denied.maxBufferLengthBytes = bytes - 1;
           rejects([&] { (void)linearTuningFixtureBytes(denied, workload); });
@@ -332,7 +333,16 @@ void gpuBatchEquivalence(metal::MetalBackend &backend,
       allocate(epilogue == LinearEpilogue::Residual ?
           uint64_t{baseline.storageRows()} * workload.matrix.outputSize * 2 : 0),
       allocate(baseline.gateScratchBytes()), allocate(baseline.downSumsBytes())};
-  const auto scratch = baseline.scratchSize();
+  LinearScratchSize scratch;
+  // This fixture runs every candidate, whose K split count can require more
+  // partials than the default. Match the production tuner's field maxima.
+  for (const auto &plan : plans) {
+    const auto needed = plan.scratchSize();
+    scratch.input = std::max(scratch.input, needed.input);
+    scratch.sums = std::max(scratch.sums, needed.sums);
+    scratch.partials = std::max(scratch.partials, needed.partials);
+    scratch.counters = std::max(scratch.counters, needed.counters);
+  }
   buffers.scratch = {allocate(scratch.input), allocate(scratch.sums),
                      allocate(scratch.partials), allocate(scratch.counters)};
   if (buffers.scratch.counters)

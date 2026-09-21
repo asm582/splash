@@ -149,3 +149,7 @@ comparison against MLX Serve or Ollama was performed.
 
 Long-context attention remains a substantial optimization opportunity. The
 experiments above rule out these implementations, not every possible redesign.
+
+The subsequent [device-policy convergence pass](device-policy.md) preserves
+these defaults, removes superseded policy code and expands bounded offline
+calibration across core counts.

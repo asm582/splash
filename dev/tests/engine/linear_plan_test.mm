@@ -87,33 +87,23 @@ uint32_t expectedGroups(uint32_t tiles, uint32_t cores, GroupRule rule) {
   return rule.wave * cores;
 }
 
-// The one-lane rule as properties, in 256-wide tiles per core: split-K (four
-// K partitions of one tile, full grid, K % 1024 == 0) up to one tile per core
-// on Apple10 and two on Apple9, where the 128-thread Split32 grid wins while
-// it alone holds 12 to 24 simdgroups per core; gate/up up to two tiles per
-// core on both; a plain projection from eight tiles per core takes
-// four-simdgroup N256 groups, one wave of four per core on Apple10 and the
-// full grid on Apple9. Anything else keeps the multi-lane rules below.
-std::optional<ExpectedConfig> expectedOneLane(uint32_t family, uint32_t cores,
+// Apple10 one-lane MPP rules: split-K at up to one N256 tile per
+// core (two for gate/up), paired N256 from eight tiles per core.
+std::optional<ExpectedConfig> expectedOneLane(uint32_t cores,
                                               LinearMatrix matrix, LinearEpilogue epilogue) {
   const uint32_t n = matrix.outputSize;
   const uint32_t tiles256 = n / 256;
   const bool splitK = matrix.inputSize % 1024 == 0;
-  const bool apple10 = family >= 10;
   if (epilogue == LinearEpilogue::GateUp) {
     if (splitK && tiles256 <= 2 * cores)
       return ExpectedConfig{LinearTile::Split32, n / 32, LinearSimdgroups::Four};
     return std::nullopt;
   }
-  if (splitK && tiles256 <= (apple10 ? 1U : 2U) * cores) {
-    const uint32_t split32SimdgroupsPerCore = n / 32 * 4 / cores;
-    if (!apple10 && split32SimdgroupsPerCore >= 12 && split32SimdgroupsPerCore <= 24)
-      return ExpectedConfig{LinearTile::Split32, n / 32, LinearSimdgroups::Four};
+  if (splitK && tiles256 <= cores)
     return ExpectedConfig{LinearTile::Split64, n / 64, LinearSimdgroups::Eight};
-  }
   if (epilogue == LinearEpilogue::None && tiles256 >= 8 * cores)
     return ExpectedConfig{LinearTile::Paired256,
-                          apple10 ? std::min(tiles256, 4 * cores) : tiles256,
+                          std::min(tiles256, 4 * cores),
                           LinearSimdgroups::Four};
   return std::nullopt;
 }
@@ -140,8 +130,8 @@ ExpectedConfig expectedDecode(uint32_t family, uint32_t cores, LinearMatrix matr
   const auto groups = [&](uint32_t tiles, GroupRule rule) {
     return family >= 10 ? expectedGroups(tiles, cores, rule) : tiles;
   };
-  if (lanes == 1)
-    if (const auto oneLane = expectedOneLane(family, cores, matrix, epilogue)) return *oneLane;
+  if (family >= 10 && lanes == 1)
+    if (const auto oneLane = expectedOneLane(cores, matrix, epilogue)) return *oneLane;
   if (epilogue == LinearEpilogue::GateUp) {
     if (family >= 10) return {LinearTile::N256, expectedGroups(tiles256, cores, gateUp)};
     return {LinearTile::N256, std::min(tiles256, uint32_t(std::lround(2.25 * cores)))};
@@ -339,7 +329,7 @@ void baselinePlans() {
               // The assumed 64-core GPU takes the more parallel split grid.
               configured(10, 0, gateUp) == LinearConfig{LinearTile::Split32, 544, LinearSimdgroups::Four},
           "fused gate/up grid does not follow the balanced two-tile rule");
-  // Apple9 keeps the shipped one-tile grids and 2.25 gate/up groups per core.
+  // Apple9 scales single-lane K splits; wider batches retain their grids.
   require(configured(9, 16, gateUp) == LinearConfig{LinearTile::Simdgroup, 544, LinearSimdgroups::Four, 1} &&
               configured(9, 20, gateUp) == LinearConfig{LinearTile::Simdgroup, 544, LinearSimdgroups::Four, 1} &&
               configured(9, 20, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Simdgroup, 260, LinearSimdgroups::Four, 2} &&
@@ -454,13 +444,11 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   device.appleGpuFamily = family;
   device.gpuCoreCount = cores;
   Q4Linear linear(device);
-  // 23040 is 90 tiles of 256: above the split-K bound and below the paired
-  // N256 bound of a 16-core Apple10 GPU, so its one-lane plain baseline is a
-  // Paired128 group count of its own and every one-lane candidate is listed
-  // beside it. That is the widest candidate set the operator can produce.
+  // Include a wide Apple9 projection with four distinct persistent grids,
+  // both paired N256 grids and all four K splits to reach the candidate bound.
   for (const LinearMatrix matrix : {LinearMatrix{512, 256}, LinearMatrix{768, 768},
                                     LinearMatrix{16640, 5120}, LinearMatrix{12544, 2048},
-                                    LinearMatrix{23040, 2048}}) {
+                                    LinearMatrix{23040, 2048}, LinearMatrix{131072, 4096}}) {
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                                  LinearEpilogue::GateUp}) {
@@ -471,7 +459,7 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
         widestCandidates = std::max(widestCandidates, candidates.size());
         require(candidates.front().configuration() == linear.plan(workload).configuration(),
                 "Linear baseline is not first candidate");
-        uint32_t fourScopeCandidates = 0, splitCandidates = 0;
+        uint32_t fourScopeCandidates = 0, splitCandidates = 0, simdgroupCandidates = 0;
         for (size_t index = 0; index < candidates.size(); ++index) {
           const auto &plan = candidates[index];
           const bool four = plan.configuration().simdgroups == LinearSimdgroups::Four;
@@ -485,6 +473,7 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
                         plan.secondPipeline().empty(),
                     "split-K candidate escaped its one-lane full-grid contract");
           } else if (plan.usesSimdgroup()) {
+            ++simdgroupCandidates;
             require(lanes == 1 && family == 9 && four &&
                         plan.partialSums() == plan.configuration().splits &&
                         plan.configuration().groups == matrix.outputSize / plan.tileColumns(),
@@ -523,6 +512,12 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
                     ((lanes == 3 && epilogue != LinearEpilogue::GateUp) ||
                      (lanes == 1 && (family == 9 || epilogue == LinearEpilogue::None || matrix.inputSize % 1024 == 0))),
                 "Linear candidate set omitted or added four-SIMDgroup plans");
+        uint32_t legalSplits = 0;
+        if (lanes == 1 && family == 9)
+          for (uint32_t split : {1U, 2U, 4U, 8U})
+            legalSplits += matrix.inputSize % (64 * split) == 0;
+        require(simdgroupCandidates == legalSplits,
+                "Linear candidates omit a legal Apple9 K split");
         require(splitCandidates == (lanes == 1 && matrix.inputSize % 1024 == 0
                                         ? (epilogue == LinearEpilogue::GateUp ? 1U : 2U) : 0U),
                 "Linear candidate set omitted or added split-K plans");
@@ -700,6 +695,64 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
               linear.plan(fourWorkload).threadsPerThreadgroup() ==
                   baselineFourWorkload.threadsPerThreadgroup(),
           "clearing choices did not restore the shipped execution scope");
+}
+
+// Exercise continuous core counts, not just measured SKU anchors. These
+// contracts check legal grids, bounded candidates and override workspace;
+// they do not claim performance on simulated hardware.
+void scalingContracts() {
+  for (uint32_t family : {9U, 10U, 11U}) {
+    for (uint32_t index = 0; index <= 129; ++index) {
+      const uint32_t reported = index == 129 ? 4096 : index;
+      const uint32_t cores = reported ? reported : 64;
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = reported;
+      Q4Linear linear(device);
+      for (uint32_t n : {256U, 5120U, 131072U}) {
+        for (uint32_t k : {256U, 768U, 1024U, 4096U, 5120U, 17408U}) {
+          for (uint32_t rows : {8U, 16U, 24U, 32U}) {
+            for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                                 LinearEpilogue::GateUp}) {
+              const LinearWorkload w{{n, k}, rows, LinearPhase::Decode, epilogue};
+              const auto baseline = linear.plan(w);
+              const auto candidates = linear.candidates(w);
+              require(candidates.front().configuration() == baseline.configuration() &&
+                          candidates.size() <= Q4Linear::kMaximumCandidates,
+                      "core scaling lost or displaced the baseline");
+              for (size_t i = 0; i < candidates.size(); ++i) {
+                const auto &plan = candidates[i];
+                require(plan.configuration().groups > 0 &&
+                            plan.configuration().groups <= n / plan.tileColumns(),
+                        "core scaling produced an invalid grid");
+                for (size_t j = 0; j < i; ++j)
+                  require(plan.configuration() != candidates[j].configuration(),
+                          "core scaling produced duplicate candidates");
+                const std::array choice{LinearChoice{w, plan.configuration()}};
+                linear.setChoices(choice);
+                const auto scratch = linear.decodeScratchSize(w);
+                for (const auto required : {baseline.scratchSize(), plan.scratchSize()})
+                  require(scratch.input >= required.input && scratch.sums >= required.sums &&
+                              scratch.partials >= required.partials && scratch.counters >= required.counters,
+                          "installed candidate exceeds admitted Q4 workspace");
+              }
+              linear.setChoices({});
+              // N128 is available for every non-gated decode workload. Its
+              // candidate waves must follow the device, including tiny GPUs.
+              if (epilogue != LinearEpilogue::GateUp) {
+                for (uint32_t wave : {2U, 3U, 4U}) {
+                  const LinearConfig wanted{LinearTile::N128, std::min(n / 128, cores * wave)};
+                  require(std::any_of(candidates.begin(), candidates.end(), [&](const auto &p) {
+                    return p.configuration() == wanted;
+                  }), "candidate waves do not scale with GPU core count");
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 metal::MetalBuffer allocate(metal::MetalBackend &backend, uint64_t bytes) {
@@ -1143,8 +1196,9 @@ int main(int argc, char **argv) {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     baselinePlans();
     narrowM24BoundaryPlans();
-    // Apple9 at the assumed core count and the small Apple10 GPU that produces
-    // the widest candidate set.
+    scalingContracts();
+    // Apple9 at the assumed core count reaches the expanded split set;
+    // Apple10 exercises the MPP-only candidate bound.
     size_t widestCandidates = 0;
     planContracts(9, 0, widestCandidates);
     planContracts(10, 16, widestCandidates);
