@@ -91,7 +91,7 @@ inline void q4_store_input_sums(device const bfloat *input, uint input_size,
 // projections lose to the extra live registers. The epilogues still apply in
 // group order, so the results are bit-identical to the sequential form.
 template <ushort TileN, bool GateUp, bool AddResidual,
-          ushort StorageN = TileN, bool Pipelined = false>
+          ushort StorageN = TileN, bool Pipelined = false, ushort Simdgroups = 8>
 inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
                         device bfloat *scales_0, device bfloat *biases_0,
                         device bfloat *output_0, device uchar *weights_1,
@@ -103,7 +103,7 @@ inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
                   array<int, 2>{1, int(input_size)});
   constexpr auto descriptor =
       matmul2d_descriptor(8, TileN, 64, false, true, false);
-  matmul2d<descriptor, execution_simdgroups<8>> operation;
+  matmul2d<descriptor, execution_simdgroups<Simdgroups>> operation;
   auto a0 = a.slice<64, 8>(0, 0);
   uint quant_groups = input_size / 64;
   uint tile = output_origin / StorageN;
@@ -128,7 +128,7 @@ inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
   // participating threads. The descriptor's 8 x TileN destination
   // has no padding when total capacity equals that logical element count.
   const bool fullyOccupied =
-      uint(accumulated_0.get_capacity()) * (8u * 32u) == 8u * TileN;
+      uint(accumulated_0.get_capacity()) * (uint(Simdgroups) * 32u) == 8u * TileN;
   const auto traversal = fullyOccupied ? Q4Traversal::All
                                        : q4_traversal(accumulated_0);
   q4_visit(accumulated_0, traversal, [&](ushort i) {
@@ -137,7 +137,7 @@ inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
       accumulated_1[i] = 0.0f;
   });
 
-  q4_store_input_sums(input, input_size, 0, input_sums, 0, simd_lane,
+  q4_store_input_sums<8, Simdgroups>(input, input_size, 0, input_sums, 0, simd_lane,
                       simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   auto run_group = [&](uint quant_group,
@@ -180,7 +180,7 @@ inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
     });
     if ((quant_group & 3) == 3 && quant_group + 1 < quant_groups) {
       uint next_group = (quant_group + 1) >> 2;
-      q4_store_input_sums(input, input_size, quant_group * 64 + 64, input_sums,
+      q4_store_input_sums<8, Simdgroups>(input, input_size, quant_group * 64 + 64, input_sums,
                           (next_group & 1) * 32, simd_lane, simd_group);
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
