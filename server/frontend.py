@@ -195,6 +195,19 @@ class RenderedPrompt:
     thinking: bool
 
 
+def validate_served_model_name(value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(not c.isprintable() or c.isspace() or c in "\\%?#" for c in value)
+        or any(part in ("", ".", "..") for part in value.split("/"))
+    ):
+        raise ValueError(
+            "model alias must be a non-empty name without whitespace or URL delimiters"
+        )
+    return value
+
+
 class Frontend:
     def __init__(
         self,
@@ -208,6 +221,7 @@ class Frontend:
         constraint_factory=None,
         max_image_pixels=image_input.MAX_PIXELS,
         thinking_codec=None,
+        served_model_names=(),
         default_reasoning_effort=None,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
@@ -216,6 +230,14 @@ class Frontend:
         self.tokenizer = tokenizer
         self.backend = backend
         self.model = model
+        self.model_names = tuple(
+            dict.fromkeys(
+                [
+                    model,
+                    *(validate_served_model_name(name) for name in served_model_names),
+                ]
+            )
+        )
         if (
             default_reasoning_effort is not None
             and default_reasoning_effort not in REASONING_EFFORTS
@@ -238,6 +260,9 @@ class Frontend:
         self.thinking_codec = (
             ThinkingCodec() if thinking_codec is None else thinking_codec
         )
+
+    def accepts_model(self, model):
+        return isinstance(model, str) and model in self.model_names
 
     def status(self):
         status = self.backend.status()
@@ -471,7 +496,7 @@ class Frontend:
         )
         if unknown:
             raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
-        if body.get("model", self.model) != self.model:
+        if not self.accepts_model(body.get("model", self.model)):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         try:
             judgments.validate_row(body)
@@ -519,7 +544,7 @@ class Frontend:
         model = body.get("model")
         if not isinstance(model, str) or not model:
             details.append(judgments.detail(["model"], "field required", "missing"))
-        elif model != self.model:
+        elif not self.accepts_model(model):
             details.append(
                 judgments.detail(
                     ["model"], f"model {model} is not served by this endpoint"
@@ -655,7 +680,7 @@ class Frontend:
             self.preparation_slots.release()
 
     def _prepare_prompt(self, body, tool_namespaces=None, *, deadline=None):
-        if body.get("model", self.model) != self.model:
+        if not self.accepts_model(body.get("model", self.model)):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         reasoning_effort = body.get("reasoning_effort")
         if reasoning_effort is None:
