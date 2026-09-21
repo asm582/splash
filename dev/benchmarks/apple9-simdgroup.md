@@ -51,3 +51,46 @@ bfloat output rounding and epilogue propagation. The tuning qualification uses
 the same operand-based reasoning; its timing includes preparation when the
 input has no fused producer. End-to-end measurements are required to assess
 the benefit of producer fusion and changes in speculative acceptance.
+
+## End-to-end measurements (2026-09-20)
+
+M3 Max, 40 GPU cores, Apple9, macOS 27.0.0. Baseline: Q4/MoE integration
+`7a63b4c`; candidate: `2c788c0`, production build ID
+`src-c380c7f4024d8118a26d95b5ddaa32ce4eff149287e94c4cdd8db7f1ddd65566`.
+The candidate includes the later candidate-count fix and integration cleanup.
+The same local Splash packages, prompts, temperature 0, disabled reasoning,
+256 generated tokens and 32768 context limit were used for both builds.
+Each fresh server had one 64-token warmup. ABBA order, two repetitions per
+scenario per phase: 32 measured requests per model, four per build/scenario.
+
+All values below are medians. Decode throughput comes from engine token/time
+counters; a streamed message chunk is not assumed to equal a token.
+
+| Model | Scenario | Baseline tok/s | Candidate tok/s | Gain | Cycle ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 27B | technical | 34.3 | 46.5 | 35.6% | 89.2 → 60.0 |
+| 27B | python_code | 59.2 | 87.9 | 48.6% | 88.5 → 59.6 |
+| 27B | typescript_code | 64.8 | 101.7 | 56.9% | 88.0 → 60.0 |
+| 27B | repeat | 93.5 | 135.8 | 45.3% | 85.8 → 59.0 |
+| 35B | technical | 87.2 | 110.2 | 26.5% | 27.2 → 24.7 |
+| 35B | python_code | 178.0 | 185.1 | 4.0% | 27.1 → 24.7 |
+| 35B | typescript_code | 183.0 | 205.6 | 12.4% | 27.4 → 24.9 |
+| 35B | repeat | 285.1 | 315.6 | 10.7% | 28.1 → 25.3 |
+
+The M3 was on battery with automatic power mode. Absolute timings drifted
+through the longer 27B run: baseline cycles ranged roughly 77–94 ms and
+candidate cycles 55–67 ms. Preserve this limitation when quoting the results.
+An earlier shorter ABBA run measured approximately 77.1 → 55.8 ms. The real-model
+oracle independently measured a 57.1 ms one-lane cycle. These measurements do
+not establish sustained AC/high-power performance or a same-condition ranking
+against another serving engine.
+
+The M5 Pro 16-core control used the same integration/candidate comparison
+with 192 tokens, two scenarios and one repetition per phase. Decode throughput
+was 37.7 and 61.0 tok/s, changing by +0.1% and 0.0%; output hashes matched.
+
+Builds and CPU/Metal suites passed on M3 Max 40-core, M5 Pro 16-core, and
+M5 Pro 20-core. The dedicated simdgroup test passes with GPU validation on
+all three, including explicit matrix-kernel execution on Apple10. Full native
+model-runtime oracles pass for both 27B and 35B on the M3, including state
+restore, preemption continuation and one- through four-lane batch transitions.
