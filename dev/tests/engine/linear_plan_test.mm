@@ -87,20 +87,12 @@ uint32_t expectedGroups(uint32_t tiles, uint32_t cores, GroupRule rule) {
   return rule.wave * cores;
 }
 
-// Apple10 one-lane MPP rules: split-K at up to one N256 tile per
-// core (two for gate/up), paired N256 from eight tiles per core.
+// Apple10 one-lane MPP rules: paired N256 from eight tiles per core.
+// Split-K is available for offline experiments but never selected by default.
 std::optional<ExpectedConfig> expectedOneLane(uint32_t cores,
                                               LinearMatrix matrix, LinearEpilogue epilogue) {
   const uint32_t n = matrix.outputSize;
   const uint32_t tiles256 = n / 256;
-  const bool splitK = matrix.inputSize % 1024 == 0;
-  if (epilogue == LinearEpilogue::GateUp) {
-    if (splitK && tiles256 <= 2 * cores)
-      return ExpectedConfig{LinearTile::Split32, n / 32, LinearSimdgroups::Four};
-    return std::nullopt;
-  }
-  if (splitK && tiles256 <= cores)
-    return ExpectedConfig{LinearTile::Split64, n / 64, LinearSimdgroups::Eight};
   if (epilogue == LinearEpilogue::None && tiles256 >= 8 * cores)
     return ExpectedConfig{LinearTile::Paired256,
                           std::min(tiles256, 4 * cores),
@@ -336,26 +328,23 @@ void baselinePlans() {
               configured(9, 16, {{16640, 5120}, 16}) == LinearConfig{LinearTile::N128, 130} &&
               configured(9, 20, {{16640, 5120}, 32}) == LinearConfig{LinearTile::N256, 65},
           "Apple9 decode grids changed without a measurement");
-  // One-lane split-K and paired N256 anchors from the measured machines: 16-
-  // and 20-core Apple10 GPUs and a 40-core Apple9 GPU, with the 18-, 10- and
-  // 80-core extrapolations the rules imply. Split tiles take the full grid.
-  const auto split32 = [](uint32_t n) { return LinearConfig{LinearTile::Split32, n / 32, LinearSimdgroups::Four}; };
-  const auto split64 = [](uint32_t n) { return LinearConfig{LinearTile::Split64, n / 64, LinearSimdgroups::Eight}; };
+  // Former split-K defaults return to sequential tiles. Apple9 simdgroup and
+  // wide paired N256 anchors remain unchanged.
   const LinearWorkload mixer27{{5120, 6144}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearWorkload mixer35{{2048, 4096}, 8, LinearPhase::Decode, LinearEpilogue::Residual};
   const LinearWorkload draftGateUp{{6144, 2048}, 8, LinearPhase::Decode, LinearEpilogue::GateUp};
-  require(configured(10, 20, mixer27) == split64(5120) &&
+  require(configured(10, 20, mixer27) == LinearConfig{LinearTile::Paired128, 40} &&
               configured(10, 16, mixer27) == LinearConfig{LinearTile::Paired128, 40} &&
-              configured(10, 20, mixer35) == split64(2048) &&
-              configured(10, 16, mixer35) == split64(2048) &&
-              configured(10, 10, mixer35) == split64(2048) &&
+              configured(10, 20, mixer35) == LinearConfig{LinearTile::Paired128, 16} &&
+              configured(10, 16, mixer35) == LinearConfig{LinearTile::Paired128, 16} &&
+              configured(10, 10, mixer35) == LinearConfig{LinearTile::Paired128, 16} &&
               configured(10, 10, {{5120, 17408}, 8}) == LinearConfig{LinearTile::Paired128, 40} &&
-              configured(10, 20, {{1280, 5120}, 8}) == split64(1280) &&
-              configured(10, 16, {{256, 5120}, 8}) == split64(256) &&
+              configured(10, 20, {{1280, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 10} &&
+              configured(10, 16, {{256, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 2} &&
               configured(10, 20, {{6144, 5120}, 8}) == LinearConfig{LinearTile::Paired128, 48} &&
-              configured(10, 20, draftGateUp) == split32(6144) &&
-              configured(10, 16, draftGateUp) == split32(6144),
-          "Apple10 one-lane split-K anchors changed");
+              configured(10, 20, draftGateUp) == LinearConfig{LinearTile::N256, 24} &&
+              configured(10, 16, draftGateUp) == LinearConfig{LinearTile::N256, 24},
+          "Apple10 sequential defaults were not restored");
   require(configured(9, 40, mixer27) == LinearConfig{LinearTile::Simdgroup, 80, LinearSimdgroups::Four, 8} &&
               configured(9, 40, {{16640, 5120}, 8}) == LinearConfig{LinearTile::Simdgroup, 260, LinearSimdgroups::Four, 4} &&
               configured(9, 40, {{5120, 17408}, 8}) == LinearConfig{LinearTile::Simdgroup, 80, LinearSimdgroups::Four, 8} &&
@@ -454,6 +443,9 @@ void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
                                  LinearEpilogue::GateUp}) {
         const LinearWorkload workload{matrix, lanes * 8, LinearPhase::Decode, epilogue};
         const auto candidates = linear.candidates(workload);
+        require(linear.plan(workload).configuration().tile != LinearTile::Split32 &&
+                    linear.plan(workload).configuration().tile != LinearTile::Split64,
+                "offline split-K candidate became a serving default");
         require(!candidates.empty() && candidates.size() <= Q4Linear::kMaximumCandidates,
                 "Linear candidates exceed the bounded set");
         widestCandidates = std::max(widestCandidates, candidates.size());

@@ -335,12 +335,10 @@ constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
 // This is a fallback, not a calibrated optimum. Reported counts always win.
 constexpr uint32_t kAssumedGpuCores = 32;
 
-// Apple10 one-lane MPP policy, measured on 16/20-core GPUs. Split-K
-// fills narrow grids; wide plain projections reduce input re-reads with
-// paired N256 tiles at one resident wave. These are performance thresholds,
-// not kernel limits. Apple9 uses the separate simdgroup policy below.
-constexpr uint32_t kSplitTilesPerCoreApple10 = 1;
-constexpr uint32_t kSplitGateUpTilesPerCore = 2;
+// Apple10 wide plain projections reduce input re-reads with paired N256
+// tiles at one resident wave, measured on 16/20-core GPUs. Split-K remains
+// an offline candidate: its reassociation reduced speculative acceptance
+// on some measured prompts. Apple9's simdgroup policy is independent.
 constexpr uint32_t kPaired256TilesPerCore = 8;
 constexpr uint32_t kPaired256WaveGroupsPerCore = 4;
 
@@ -348,14 +346,6 @@ std::optional<LinearConfig> apple10OneLaneConfig(LinearWorkload w, uint32_t core
   // validate() requires outputSize % 256 == 0, so every tile width divides it.
   const uint32_t n = w.matrix.outputSize;
   const uint32_t tiles256 = n / 256;
-  const bool splitK = w.matrix.inputSize % kSplitInputBlock == 0;
-  if (w.epilogue == LinearEpilogue::GateUp) {
-    if (splitK && tiles256 <= kSplitGateUpTilesPerCore * cores)
-      return LinearConfig{LinearTile::Split32, n / 32, LinearSimdgroups::Four};
-    return std::nullopt;
-  }
-  if (splitK && tiles256 <= kSplitTilesPerCoreApple10 * cores)
-    return LinearConfig{LinearTile::Split64, n / 64, LinearSimdgroups::Eight};
   if (w.epilogue == LinearEpilogue::None && tiles256 >= kPaired256TilesPerCore * cores)
     return LinearConfig{LinearTile::Paired256,
                         std::min(tiles256, kPaired256WaveGroupsPerCore * cores),

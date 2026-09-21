@@ -10,6 +10,10 @@ production allocations, startup benchmarks or per-model/per-SKU tables.
 `runtime/ops/Linear.cpp` owns Q4 selection. Apple9 one-lane decode uses
 bfloat simdgroup matrices with 1/2/4/8 K partitions. Apple10 uses MPP tiles,
 with shape and core count selecting grids and the narrow M24 variant.
+Apple10 split-K tiles are offline candidates only. Their former one-lane
+defaults have been withdrawn after reproducible speculative-acceptance
+reductions on some M5 prompts. Those projections use the existing sequential
+tiles again; paired N256, M24, and Apple9 simdgroup selection are unchanged.
 Prefill and wider decode batches retain their existing rules. The obsolete
 Apple9 one-lane MPP branches have been removed; those kernels remain useful
 as qualification references and offline candidates.
