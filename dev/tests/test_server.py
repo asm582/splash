@@ -513,6 +513,7 @@ class Harness:
         timeout=2,
         max_context=128,
         default_max_new=16,
+        model="test-model",
         request_logger=None,
         constraint_factory=None,
         io_timeout=api.HTTP_IO_TIMEOUT,
@@ -522,6 +523,7 @@ class Harness:
         max_request_bytes=api.DEFAULT_MAX_REQUEST_BYTES,
         host="127.0.0.1",
         allowed_hosts=(),
+        **frontend_options,
     ):
         self.tokenizer = tokenizer or FakeTokenizer()
         runtime.pending_limit = queue_size
@@ -531,13 +533,14 @@ class Harness:
         self.app = request_frontend.Frontend(
             self.tokenizer,
             self.backend,
-            "test-model",
+            model,
             max_context,
             default_max_new,
             timeout,
             2,
             constraint_factory,
             thinking_codec=thinking_codec,
+            **frontend_options,
         )
         self.server = api.FrontendServer(
             (host, 0),
@@ -977,6 +980,7 @@ class ServerTest(unittest.TestCase):
                         "prefill_batches": 10,
                         "prefill_rows": 2048,
                         "decode_batches": 7,
+                        "decode_mixed_greedy_sampling_batches": 2,
                         "decode_batches_by_width": {
                             "b1": 1,
                             "b2": 2,
@@ -1061,6 +1065,10 @@ class ServerTest(unittest.TestCase):
         self.assertIn("splash_admission_oldest_wait_milliseconds 1250.0", metrics)
         self.assertIn("splash_scheduler_prefill_rows_total 2048", metrics)
         self.assertIn("splash_scheduler_decode_b3_total 3", metrics)
+        self.assertIn(
+            "splash_scheduler_decode_mixed_greedy_sampling_batches_total 2",
+            metrics,
+        )
         self.assertIn("splash_kv_pages_free 24", metrics)
         self.assertIn("splash_state_entries 2", metrics)
         self.assertIn("splash_state_hits_total 7", metrics)
@@ -1751,6 +1759,15 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(pixels, b"\x01\x02")
         with self.assertRaisesRegex(api.APIError, "image count"):
             app._expand_image_pads(tokens, prepared[:1], positions)
+
+    def test_image_render_marker_is_stable_across_requests(self):
+        app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
+        template = {"tokenize": False, "return_dict": False}
+        app._render_image_tokens([self._image_message()], template)
+        app._render_image_tokens([self._image_message()], template)
+        first_source = app.tokenizer.templates[-2][1]["chat_template"]
+        second_source = app.tokenizer.templates[-1][1]["chat_template"]
+        self.assertEqual(first_source, second_source)
 
     def test_image_size_is_checked_before_pixel_concatenation(self):
         app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
@@ -2994,6 +3011,12 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(Path(args.tokenizer), package / "tokenizer")
         self.assertIsNone(args.max_context)
         self.assertIsNone(args.max_memory)
+        self.assertEqual(args.kv_format, "int8")
+        self.assertNotIn("--kv-format", api._native_command(args))
+        bf16_args = api.parse_args([*required, "--kv-format", "bf16"])
+        self.assertEqual(api._native_command(bf16_args)[-2:], ["--kv-format", "bf16"])
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            api.parse_args([*required, "--kv-format", "fp16"])
         self.assertEqual(
             api.parse_args([*required, "--max-context", "262144"]).max_context, 262144
         )
@@ -3081,6 +3104,8 @@ class ServerTest(unittest.TestCase):
     def test_sigterm_uses_the_normal_main_cleanup_path(self):
         args = SimpleNamespace(
             target="target",
+            served_model_name=[],
+            default_reasoning_effort=None,
             draft="draft",
             tokenizer="tokenizer",
             model="test-model",
@@ -3097,6 +3122,7 @@ class ServerTest(unittest.TestCase):
             max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
             port=0,
             binary="splash",
+            kv_format="int8",
         )
         runtime = mock.Mock()
         runtime.readiness = native_wire.ReadyEvent(
@@ -3182,6 +3208,8 @@ class ServerTest(unittest.TestCase):
     def test_main_cleans_up_when_native_startup_fails_after_reserved_bind(self):
         args = SimpleNamespace(
             target="target",
+            served_model_name=[],
+            default_reasoning_effort=None,
             draft="draft",
             tokenizer="tokenizer",
             model="test-model",
@@ -3197,6 +3225,7 @@ class ServerTest(unittest.TestCase):
             max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
             port=0,
             binary="splash",
+            kv_format="int8",
         )
         runtime = mock.Mock()
         runtime.wait_ready.side_effect = api.engine_runtime.EngineUnhealthy("late")
@@ -3228,6 +3257,8 @@ class ServerTest(unittest.TestCase):
     def test_main_rejects_port_conflict_before_loading_or_starting_native(self):
         args = SimpleNamespace(
             target="target",
+            served_model_name=[],
+            default_reasoning_effort=None,
             draft="draft",
             tokenizer="tokenizer",
             model="test-model",
@@ -3244,6 +3275,7 @@ class ServerTest(unittest.TestCase):
             max_request_size=api.DEFAULT_MAX_REQUEST_BYTES,
             port=8000,
             binary="splash",
+            kv_format="int8",
         )
         server = mock.Mock()
         server.server_bind.side_effect = OSError(48, "Address already in use")
@@ -3358,6 +3390,93 @@ class ServerTest(unittest.TestCase):
             ),
             '{"city":"Paris"}',
         )
+
+    def test_unicode_output_stays_utf8_on_the_wire(self):
+        tokenizer = FakeTokenizer()
+        tokenizer.fragments[40] = (
+            "Hello 你好世界 こんにちは世界 안녕하세요 세계 Café 🌍\n"
+        )
+        tokenizer.fragments[41] = (
+            "<tool_call>\n<function=echo>\n<parameter=text>\n"
+            "你好世界\n</parameter>\n</function>\n</tool_call>\n"
+        )
+        tokenizer.backend_tokenizer = _byte_backend(tokenizer.fragments)
+        runtime = FakeRuntime(
+            Plan([[40]]), Plan([[40]]), Plan([[40]]), Plan([[41]]), Plan([[41]])
+        )
+        harness = self.harness(runtime, tokenizer=tokenizer)
+        text = tokenizer.fragments[40]
+        wire_text = json.dumps(text, ensure_ascii=False)[1:-1].encode()
+        tools = [{"type": "function", "function": {"name": "echo"}}]
+
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body(reasoning_effort="none")
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(wire_text, payload)
+        self.assertNotIn(b"\\u4f60", payload)
+        self.assertNotIn(b"\\ud83c", payload)
+        self.assertEqual(json.loads(payload)["choices"][0]["message"]["content"], text)
+
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            self.body(stream=True, reasoning_effort="none"),
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("🌍".encode(), payload)
+        self.assertNotIn(b"\\ud83c", payload)
+        chunks = [
+            json.loads(line[6:])
+            for line in payload.decode().splitlines()
+            if line.startswith("data: {")
+        ]
+        streamed = "".join(
+            chunk["choices"][0]["delta"].get("content", "") for chunk in chunks
+        )
+        self.assertEqual(streamed, text)
+
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/responses",
+            self.responses_body(stream=True, reasoning={"effort": "none"}),
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("🌍".encode(), payload)
+        self.assertNotIn(b"\\ud83c", payload)
+        events = self.response_events(payload)
+        streamed = "".join(
+            event["delta"]
+            for event in events
+            if event["type"] == "response.output_text.delta"
+        )
+        self.assertEqual(streamed, text)
+
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    self.body(tools=tools, stream=stream, reasoning_effort="none"),
+                )
+                self.assertEqual(status, 200)
+                self.assertIn("你好世界".encode(), payload)
+                self.assertNotIn(b"\\u4f60", payload)
+                if stream:
+                    chunks = [
+                        json.loads(line[6:])
+                        for line in payload.decode().splitlines()
+                        if line.startswith("data: {")
+                    ]
+                    arguments = "".join(
+                        delta["function"].get("arguments", "")
+                        for chunk in chunks
+                        for delta in chunk["choices"][0]["delta"].get("tool_calls", [])
+                    )
+                else:
+                    message = json.loads(payload)["choices"][0]["message"]
+                    arguments = message["tool_calls"][0]["function"]["arguments"]
+                self.assertEqual(arguments, '{"text":"你好世界"}')
 
     def test_streaming_tool_call_arrives_before_native_done(self):
         plan = Plan([[13]], reason="length", after_terminal=True)

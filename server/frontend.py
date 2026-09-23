@@ -16,7 +16,7 @@ from jinja2 import TemplateError
 
 if __package__:
     from . import images as image_input
-    from . import judgments
+    from . import json_codec, judgments
     from . import protocol as wire
     from .api_shapes import (
         IMAGE_PAD_TOKEN,
@@ -31,6 +31,7 @@ if __package__:
     from .latency import LatencyMetrics
     from .metrics import is_finite_number
     from .thinking import ThinkingCodec
+    from .tokenization import PromptTokenizer
     from .tool_schema import (
         THINK_END,
         ToolPolicy,
@@ -41,6 +42,7 @@ if __package__:
     )
 else:
     import images as image_input
+    import json_codec
     import judgments
     import protocol as wire
     from api_shapes import (
@@ -56,6 +58,7 @@ else:
     from latency import LatencyMetrics
     from metrics import is_finite_number
     from thinking import ThinkingCodec
+    from tokenization import PromptTokenizer
     from tool_schema import (
         THINK_END,
         ToolPolicy,
@@ -67,6 +70,7 @@ else:
 
 
 PREPARATION_WAIT_SECONDS = 30.0
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 REASONING_EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
 
 
@@ -74,6 +78,10 @@ MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
 
 
 RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
+
+
+# A stable marker lets repeated image requests reuse the compiled template.
+IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
 
 
 def _thinking_from_prefix(rendered):
@@ -99,7 +107,7 @@ class StoredResponse:
 
     @property
     def response(self):
-        return json.loads(self.response_json)
+        return json_codec.loads(self.response_json)
 
 
 class ResponseStore:
@@ -131,12 +139,9 @@ class ResponseStore:
         return record
 
     def put(self, response, history_items):
-        def encode(value):
-            return json.dumps(
-                value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-            ).encode()
-
-        record = StoredResponse(encode(response), encode(history_items))
+        record = StoredResponse(
+            json_codec.encode(response), json_codec.encode(history_items)
+        )
         if record.size > self.budget_bytes:
             return False
         response_id = response["id"]
@@ -192,6 +197,19 @@ class RenderedPrompt:
     thinking: bool
 
 
+def validate_served_model_name(value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(not c.isprintable() or c.isspace() or c in "\\%?#" for c in value)
+        or any(part in ("", ".", "..") for part in value.split("/"))
+    ):
+        raise ValueError(
+            "model alias must be a non-empty name without whitespace or URL delimiters"
+        )
+    return value
+
+
 class Frontend:
     def __init__(
         self,
@@ -205,13 +223,30 @@ class Frontend:
         constraint_factory=None,
         max_image_pixels=image_input.MAX_PIXELS,
         thinking_codec=None,
+        served_model_names=(),
+        default_reasoning_effort=None,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
         self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
+        self.prompt_tokenizer = PromptTokenizer(tokenizer)
         self.backend = backend
         self.model = model
+        self.model_names = tuple(
+            dict.fromkeys(
+                [
+                    model,
+                    *(validate_served_model_name(name) for name in served_model_names),
+                ]
+            )
+        )
+        if (
+            default_reasoning_effort is not None
+            and default_reasoning_effort not in REASONING_EFFORTS
+        ):
+            raise ValueError("invalid default_reasoning_effort")
+        self.default_reasoning_effort = default_reasoning_effort
         self.max_context = max_context
         self.default_max_new = default_max_new
         self.request_timeout = request_timeout
@@ -229,6 +264,9 @@ class Frontend:
             ThinkingCodec() if thinking_codec is None else thinking_codec
         )
 
+    def accepts_model(self, model):
+        return isinstance(model, str) and model in self.model_names
+
     def status(self):
         status = self.backend.status()
         with self.preparation_lock:
@@ -241,6 +279,7 @@ class Frontend:
             status["grammar_cache"] = self.constraint_factory.stats()
         status["response_store"] = self.response_store.stats()
         status["image_cache"] = self.images.stats()
+        status["tokenizer_cache"] = self.prompt_tokenizer.stats()
         status["latency"] = self.latencies.snapshot()
         return status
 
@@ -310,16 +349,15 @@ class Frontend:
         documentation or source containing literal vision tokens.
         """
         source = self.tokenizer.get_chat_template(tools=template.get("tools"))
-        marker = f"__splash_image_{secrets.token_hex(16)}__"
         rendered = self._apply_chat_template(
             messages,
             {
                 **template,
                 "tokenize": False,
-                "chat_template": source.replace(IMAGE_PAD_TOKEN, marker),
+                "chat_template": source.replace(IMAGE_PAD_TOKEN, IMAGE_RENDER_MARKER),
             },
         )
-        parts = rendered.split(marker)
+        parts = rendered.split(IMAGE_RENDER_MARKER)
         image_offsets = set()
         offset = 0
         for part in parts[:-1]:
@@ -462,7 +500,7 @@ class Frontend:
         )
         if unknown:
             raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
-        if body.get("model", self.model) != self.model:
+        if not self.accepts_model(body.get("model", self.model)):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         try:
             judgments.validate_row(body)
@@ -510,7 +548,7 @@ class Frontend:
         model = body.get("model")
         if not isinstance(model, str) or not model:
             details.append(judgments.detail(["model"], "field required", "missing"))
-        elif model != self.model:
+        elif not self.accepts_model(model):
             details.append(
                 judgments.detail(
                     ["model"], f"model {model} is not served by this endpoint"
@@ -646,13 +684,14 @@ class Frontend:
             self.preparation_slots.release()
 
     def _prepare_prompt(self, body, tool_namespaces=None, *, deadline=None):
-        if body.get("model", self.model) != self.model:
+        if not self.accepts_model(body.get("model", self.model)):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         reasoning_effort = body.get("reasoning_effort")
+        if reasoning_effort is None:
+            reasoning_effort = self.default_reasoning_effort
         if reasoning_effort is not None and (
             not isinstance(reasoning_effort, str)
-            or reasoning_effort
-            not in ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+            or reasoning_effort not in REASONING_EFFORTS
         ):
             raise APIError(400, "invalid reasoning_effort")
         preserve_thinking = body.get("preserve_thinking")
@@ -750,7 +789,8 @@ class Frontend:
                 )
             else:
                 rendered = self._apply_chat_template(prompt.messages, template)
-                tokens = self._tokenize(rendered, add_special_tokens=False)["input_ids"]
+                with self.latencies.measure("tokenization"):
+                    tokens = self.prompt_tokenizer.encode(rendered)
         except APIError:
             raise
         except Exception as error:
@@ -863,17 +903,20 @@ class Frontend:
         image_positions, thinking = rendered.image_positions, rendered.thinking
         constraint = None
         remaining_request_time(deadline)
-        if self.constraint_factory is not None:
-            if tools:
-                constraint = self.constraint_factory.create(
-                    tool_grammar(tool_policy, thinking, response_schema),
-                    timeout=remaining_request_time(deadline),
-                )
-            elif response_schema is not None:
-                constraint = self.constraint_factory.create(
-                    json_grammar(response_schema, thinking),
-                    timeout=remaining_request_time(deadline),
-                )
+        if self.constraint_factory is not None and (
+            tools or response_schema is not None
+        ):
+            with self.latencies.measure("grammar"):
+                if tools:
+                    constraint = self.constraint_factory.create(
+                        tool_grammar(tool_policy, thinking, response_schema),
+                        timeout=remaining_request_time(deadline),
+                    )
+                elif response_schema is not None:
+                    constraint = self.constraint_factory.create(
+                        json_grammar(response_schema, thinking),
+                        timeout=remaining_request_time(deadline),
+                    )
         remaining_request_time(deadline)
         tools_signature = None
         if tools:
@@ -964,7 +1007,7 @@ class Frontend:
                 # Reserve its input bytes before materializing the history.
                 if reserve_input is not None:
                     reserve_input(len(previous.history_json))
-                previous_items = json.loads(previous.history_json)
+                previous_items = json_codec.loads(previous.history_json)
             chat = responses_to_chat_body(body, previous_items)
             namespaces = chat.pop("_tool_namespaces")
             job, thinking, has_tools = self._prepare(chat, namespaces, deadline)

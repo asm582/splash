@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 
 if __package__:
     from . import images as image_input
-    from . import judgments
+    from . import json_codec, judgments
     from . import runtime as engine_runtime
     from .api_shapes import (
         anthropic_response,
@@ -42,13 +42,14 @@ if __package__:
     from .constraints import ConstraintFactory, validate_tokenizer
     from .diagnostics import log_unexpected, print_request, print_status
     from .errors import APIError, ContextLengthError
-    from .frontend import Frontend
+    from .frontend import REASONING_EFFORTS, Frontend, validate_served_model_name
     from .http_security import authenticate, validate_api_key, validate_headers
     from .latency import RequestLatency
     from .metrics import (
         is_finite_number,
         metrics_dict,
         prometheus_metrics,
+        timings_dict,
         usage_dict,
     )
     from .output import (
@@ -60,9 +61,9 @@ if __package__:
         validate_tool_calls,
     )
     from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
-    from .tool_schema import strict_json_loads
 else:
     import images as image_input
+    import json_codec
     import judgments
     from api_shapes import (
         anthropic_response,
@@ -81,10 +82,16 @@ else:
     from constraints import ConstraintFactory, validate_tokenizer
     from diagnostics import log_unexpected, print_request, print_status
     from errors import APIError, ContextLengthError
-    from frontend import Frontend
+    from frontend import REASONING_EFFORTS, Frontend, validate_served_model_name
     from http_security import authenticate, validate_api_key, validate_headers
     from latency import RequestLatency
-    from metrics import is_finite_number, metrics_dict, prometheus_metrics, usage_dict
+    from metrics import (
+        is_finite_number,
+        metrics_dict,
+        prometheus_metrics,
+        timings_dict,
+        usage_dict,
+    )
     from output import (
         ReasoningSplitter,
         StreamingToolCallProjector,
@@ -94,7 +101,6 @@ else:
         validate_tool_calls,
     )
     from thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
-    from tool_schema import strict_json_loads
 
     import runtime as engine_runtime
 
@@ -222,7 +228,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _json(self, status, payload):
-        data = json.dumps(payload, separators=(",", ":")).encode()
+        try:
+            data = json_codec.encode(payload)
+        except json_codec.JSONEncodingError as error:
+            log_unexpected(error)
+            self._error(
+                APIError(500, "internal server error", "internal_server_error"),
+                self.path.partition("?")[0].startswith("/v1/messages"),
+            )
+            return
         self._send(status, data, "application/json")
 
     def _error(self, error, anthropic=False):
@@ -321,7 +335,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.connection.settimeout(self.server.io_timeout)
         text = payload.decode(json.detect_encoding(payload), "surrogatepass")
         payload.clear()
-        return strict_json_loads(text)
+        return json_codec.loads(text)
 
     def do_HEAD(self):
         self.do_GET()
@@ -374,25 +388,38 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         model_path = _normalize_path(self.path)
         if model_path == "/v1/models" or model_path.startswith("/v1/models/"):
-            model = {
-                "id": self.app.model,
-                "object": "model",
-                "created": 0,
-                "owned_by": "splash",
-            }
-            # TypeSafe SDK compatibility: models.list() reads "models" entries.
-            # The release date is not tracked locally and stays unknown.
-            typed = {
-                "name": self.app.model,
-                "description": "Splash resident model",
-                "release_date": "",
-            }
+            models = [
+                {
+                    "id": name,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "splash",
+                    "max_model_len": self.app.max_context,
+                    "context_length": self.app.max_context,
+                    **({"root": self.app.model} if name != self.app.model else {}),
+                }
+                for name in self.app.model_names
+            ]
             if model_path == "/v1/models":
-                self._json(200, {"object": "list", "data": [model], "models": [typed]})
-            elif model_path.removeprefix("/v1/models/") == self.app.model:
-                self._json(200, model)
+                # TypeSafe SDK compatibility: models.list() reads "models" entries.
+                typed = [
+                    {
+                        "name": item["id"],
+                        "description": "Splash resident model",
+                        "release_date": "",
+                    }
+                    for item in models
+                ]
+                self._json(200, {"object": "list", "data": models, "models": typed})
             else:
-                self._safe_error(APIError(404, "model not found", "model_not_found"))
+                name = model_path.removeprefix("/v1/models/")
+                model = next((item for item in models if item["id"] == name), None)
+                if model is None:
+                    self._safe_error(
+                        APIError(404, "model not found", "model_not_found")
+                    )
+                else:
+                    self._json(200, model)
             return
         self._safe_error(APIError(404, "not found", "not_found"))
 
@@ -1100,17 +1127,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _sse(self, payload):
         data = (
-            payload
+            payload.encode("utf-8")
             if isinstance(payload, str)
-            else json.dumps(payload, separators=(",", ":"))
+            else json_codec.encode(payload)
         )
-        self.wfile.write(f"data: {data}\n\n".encode())
+        self.wfile.write(b"data: " + data + b"\n\n")
         self.wfile.flush()
         self._last_sse_write = time.monotonic()
 
     def _responses_sse(self, event, payload):
-        data = json.dumps(payload, separators=(",", ":"))
-        self.wfile.write(f"event: {event}\ndata: {data}\n\n".encode())
+        data = json_codec.encode(payload)
+        self.wfile.write(f"event: {event}\ndata: ".encode() + data + b"\n\n")
         self.wfile.flush()
         self._last_sse_write = time.monotonic()
 
@@ -1516,6 +1543,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     created,
                     {},
                     finish_reason(result, tool_calls),
+                    timings=timings_dict(result),
                 )
             )
             if stream_options.get("include_usage"):
@@ -1617,13 +1645,8 @@ class RequestBodyReservation:
             policy.namespaces if policy else None,
             job.stop_sequences,
         )
-        encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
         retained = [value for value in retained if value]
-        size = (
-            sum(len(part.encode()) for part in encoder.iterencode(retained))
-            if retained
-            else 0
-        )
+        size = json_codec.encoded_size(retained) if retained else 0
         if size > self.size:
             self.grow(size - self.size)
         else:
@@ -1824,8 +1847,27 @@ def parse_args(argv=None):
     parser.add_argument(
         "--model", type=_parse_model_id, required=True, metavar="OWNER/REPO"
     )
+    parser.add_argument(
+        "--served-model-name",
+        action="append",
+        default=[],
+        type=validate_served_model_name,
+        help="additional API model name; responses still identify the loaded model (repeatable)",
+    )
+    parser.add_argument(
+        "--default-reasoning-effort",
+        choices=REASONING_EFFORTS,
+        default=os.environ.get("SPLASH_DEFAULT_REASONING_EFFORT"),
+        help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
+    )
     parser.add_argument("--max-context", type=_parse_max_context, default=None)
     parser.add_argument("--max-memory", type=_parse_max_memory, default=None)
+    parser.add_argument(
+        "--kv-format",
+        choices=("int8", "bf16"),
+        default="int8",
+        help="target KV cache storage (default: int8); bf16 uses more memory",
+    )
     parser.add_argument(
         "--max-request-size",
         type=_parse_request_size,
@@ -1844,6 +1886,13 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
     args = parser.parse_args(argv)
+    if (
+        args.default_reasoning_effort is not None
+        and args.default_reasoning_effort not in REASONING_EFFORTS
+    ):
+        parser.error(
+            "invalid --default-reasoning-effort / SPLASH_DEFAULT_REASONING_EFFORT"
+        )
     if args.api_key is not None:
         try:
             validate_api_key(args.api_key)
@@ -1874,6 +1923,8 @@ def _native_command(args):
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
+    if args.kv_format != "int8":
+        command.extend(("--kv-format", args.kv_format))
     return command
 
 
@@ -1949,6 +2000,8 @@ def main():
             constraint_factory,
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
+            served_model_names=args.served_model_name,
+            default_reasoning_effort=args.default_reasoning_effort,
         )
         server.app = app
         server.server_activate()

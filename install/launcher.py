@@ -24,6 +24,7 @@ except ImportError:  # Executed directly by the source or packaged entry point.
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
 PORT = 8000
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 BASE_URL = f"http://127.0.0.1:{PORT}"
 
 
@@ -178,6 +179,14 @@ def serve(args):
             "--max-context",
             "auto" if args.max_context is None else str(args.max_context),
         ]
+        if args.kv_format != "int8":
+            command.extend(("--kv-format", args.kv_format))
+        for name in args.served_model_name:
+            command.append(f"--served-model-name={name}")
+        if args.default_reasoning_effort is not None:
+            command.extend(
+                ["--default-reasoning-effort", args.default_reasoning_effort]
+            )
         if args.max_request_size is not None:
             command.extend(["--max-request-size", str(args.max_request_size)])
         if args.max_image_pixels is not None:
@@ -212,7 +221,7 @@ def coding_client(args):
     models = catalog.get("data", []) if isinstance(catalog, dict) else []
     if (
         not isinstance(models, list)
-        or len(models) != 1
+        or not models
         or not isinstance(models[0], dict)
         or models[0].get("owned_by") != "splash"
     ):
@@ -222,6 +231,11 @@ def coding_client(args):
         raise LauncherError(
             "Splash is running but its context limit is not available yet; wait and retry"
         )
+    # Only opencode needs its major version: the launch defaults changed
+    # between its first and second major releases. A failed probe adds nothing.
+    client_version = (
+        clients.probe_major_version(path) if args.command == "opencode" else None
+    )
     command, environment = clients.command(
         args.command,
         path,
@@ -230,6 +244,7 @@ def coding_client(args):
         context,
         _runtime_dir(args.port),
         client_args=args.client_args,
+        client_version=client_version,
     )
     print(f"Starting {args.command}: {model} · {context:,} context tokens", flush=True)
     if args.command == "claude":
@@ -312,6 +327,30 @@ def _version():
     )
 
 
+def _parse_served_model_name(value):
+    if (
+        not value
+        or any(not c.isprintable() or c.isspace() or c in "\\%?#" for c in value)
+        or any(part in ("", ".", "..") for part in value.split("/"))
+    ):
+        raise argparse.ArgumentTypeError(
+            "model alias must be a non-empty name without whitespace or URL delimiters"
+        )
+    return value
+
+
+def _parse_max_image_pixels(value):
+    try:
+        pixels = int(value)
+    except ValueError:
+        pixels = 0
+    # Match the server's supported image budget without importing its runtime
+    # dependencies before help, argument validation or first-time installation.
+    if not 65_536 <= pixels <= 4_194_304:
+        raise argparse.ArgumentTypeError("must be between 65536 and 4194304 pixels")
+    return pixels
+
+
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     client_args = []
@@ -322,10 +361,34 @@ def parse_args(argv=None):
     elif "--" in argv:
         boundary = argv.index("--")
         argv, client_args = argv[:boundary], argv[boundary + 1 :]
-    parser = argparse.ArgumentParser(prog="splash", description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="splash",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Quick start:\n"
+            "  splash serve --model incoai/Qwen3.8-27B-Splash\n"
+            "  splash opencode  # in another terminal, after Ready\n\n"
+            "Use splash serve --help for server settings. Client arguments,\n"
+            "including --help, are passed through to the installed agent."
+        ),
+    )
     parser.add_argument("--version", action="version", version=_version())
     commands = parser.add_subparsers(dest="command", required=True)
-    server = commands.add_parser("serve", help="run the local server; Ctrl+C stops it")
+    server = commands.add_parser(
+        "serve",
+        help="run the local server; Ctrl+C stops it",
+        description="Download a Splash model package if needed, then serve in the foreground.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  splash serve --model incoai/Qwen3.8-27B-Splash\n"
+            "  splash serve --model incoai/Qwen3.6-35B-A3B-Splash --max-context 128K\n\n"
+            "After Ready, open http://127.0.0.1:8000 or connect an installed agent.\n"
+            "The startup summary and /status report the effective context limit.\n"
+            "A client may impose a smaller limit. Keep this terminal open; Ctrl+C stops serving."
+        ),
+    )
     server.add_argument(
         "--host",
         default="127.0.0.1",
@@ -345,6 +408,25 @@ def parse_args(argv=None):
         help="Hugging Face repository containing a Splash package",
     )
     server.add_argument(
+        "--served-model-name",
+        action="append",
+        default=[],
+        type=_parse_served_model_name,
+        help="additional API model name; responses keep the loaded model ID (repeatable)",
+    )
+    server.add_argument(
+        "--default-reasoning-effort",
+        choices=REASONING_EFFORTS,
+        default=os.environ.get("SPLASH_DEFAULT_REASONING_EFFORT"),
+        help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
+    )
+    server.add_argument(
+        "--kv-format",
+        choices=("int8", "bf16"),
+        default="int8",
+        help="target KV cache storage (default: int8); bf16 uses more memory",
+    )
+    server.add_argument(
         "--max-memory",
         type=_parse_max_memory,
         help="Metal budget ceiling, e.g. 28G (default: auto)",
@@ -352,7 +434,7 @@ def parse_args(argv=None):
     server.add_argument(
         "--max-context",
         type=_parse_max_context,
-        help="context limit, e.g. 100K (default: auto)",
+        help="context token limit, up to 256K (K = 1024; default: auto within the memory budget)",
     )
     server.add_argument(
         "--allowed-host",
@@ -369,7 +451,9 @@ def parse_args(argv=None):
         "shared input budget is max(512M, twice this limit)",
     )
     server.add_argument(
-        "--max-image-pixels", type=int, help="maximum resized pixels per image"
+        "--max-image-pixels",
+        type=_parse_max_image_pixels,
+        help="maximum resized pixels per image, 65536–4194304 (default: 4194304)",
     )
     server.add_argument(
         "--api-key",
@@ -380,6 +464,14 @@ def parse_args(argv=None):
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
+    if (
+        args.command == "serve"
+        and args.default_reasoning_effort is not None
+        and args.default_reasoning_effort not in REASONING_EFFORTS
+    ):
+        parser.error(
+            "invalid --default-reasoning-effort / SPLASH_DEFAULT_REASONING_EFFORT"
+        )
     if args.command in clients.INSTALL_URLS:
         try:
             args.port = _parse_port(os.environ.get("SPLASH_PORT", str(PORT)))

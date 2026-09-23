@@ -47,8 +47,8 @@ constexpr std::array moeFields{
     &MoeWorkspace::groupedInputBytes, &MoeWorkspace::expertIntermediateBytes,
     &MoeWorkspace::expertOutputBytes};
 
-kv::Q8Layout layout(AttentionShape shape, uint32_t layers = 1) {
-  return {layers, shape.kvHeads, shape.headDimension};
+kv::Layout layout(AttentionShape shape, uint32_t layers = 1) {
+  return {layers, shape.kvHeads, shape.headDimension, shape.format};
 }
 DeviceCapabilities device(uint32_t family = 10) {
   DeviceCapabilities value;
@@ -87,8 +87,8 @@ void baselinePlans() {
         }
       }
       require(plans.gateUpWorkspace(matrix) == gateBound &&
-                  gateBound == uint64_t{32} * matrix.outputSize * 2,
-              "gate/up bound omitted baseline B3/B4 scratch");
+                  gateBound == (family == 9 ? 0 : uint64_t{32} * matrix.outputSize * 2),
+              "gate/up workspace disagrees with fused or decomposed baseline");
       for (uint32_t rows : {1U, 17U, 2048U})
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                               LinearEpilogue::UpWithGate}) {
@@ -156,8 +156,51 @@ void baselinePlans() {
         covers(prefill, plans.moePrefill(shape, rows).workspace(), 1, moeFields);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const auto selected = plans.moeDecode(shape, lanes);
-        require(selected.tileRows() == 8, "MoE decode baseline changed");
+        require(selected.tileRows() == 8 &&
+                    selected.config().m8Simdgroups == moeDecodeSimdgroups(family),
+                "MoE decode baseline changed");
         covers(stride, selected.workspace(), lanes, moeFields);
+      }
+    }
+  }
+}
+
+// Apple9 decode plans run the four-simdgroup 8-row expert tiles; every other
+// family, and prefill on every family, keeps the shipped N128 x 8 tile. The
+// choice is the device's: candidates carry it and installed tables cannot
+// override it.
+void moeDeviceTiles() {
+  for (uint32_t family : {0U, 9U, 10U, 11U}) {
+    const auto expected = family == 9 ? MoeExpertSimdgroups::Four
+                                      : MoeExpertSimdgroups::Eight;
+    require(moeDecodeSimdgroups(family) == expected,
+            "decode expert simdgroups are not gated on GPU family 9");
+    ExecutionPlans plans(device(family));
+    for (auto shape : moeShapes) {
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+        const MoeWorkload workload{shape, lanes * 8, MoePhase::Decode};
+        require(plans.moeDecode(shape, lanes).config().m8Simdgroups == expected,
+                "MoE decode plan departed from the device tile policy");
+        for (const auto &candidate : plans.moeCandidates(workload)) {
+          require(candidate.config().m8Simdgroups == expected,
+                  "MoE decode candidate departed from the device tile policy");
+          OperatorChoices choices;
+          choices.moe.push_back({workload, candidate.config()});
+          choices.moe.back().configuration.m8Simdgroups =
+              expected == MoeExpertSimdgroups::Four ? MoeExpertSimdgroups::Eight
+                                                    : MoeExpertSimdgroups::Four;
+          plans.install(choices);
+          require(plans.moeDecode(shape, lanes).config() == candidate.config(),
+                  "installed MoE choice overrode the device tile policy");
+        }
+      }
+      for (uint32_t rows : {1U, 8U, 17U, 2048U}) {
+        require(plans.moePrefill(shape, rows).config().m8Simdgroups ==
+                    MoeExpertSimdgroups::Eight,
+                "MoE prefill plan left the shipped expert tile");
+        for (const auto &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill}))
+          require(candidate.config().m8Simdgroups == MoeExpertSimdgroups::Eight,
+                  "MoE prefill candidate left the shipped expert tile");
       }
     }
   }
@@ -305,6 +348,16 @@ void policyKeysAndBounds() {
                                       {PrefillSplitMultiplier::Two}});
   plans.install(choices);
   requireMixed(plans);
+  const kv::Layout bf16{1, 4, 256, kv::Format::BFloat16};
+  const std::array<uint32_t, 3> bf16Histories{31, 32, 2049};
+  require(plans.prefillAttention(2048, 24, bf16, 2049).configuration ==
+              PrefillAttentionConfig{} &&
+              plans.verifyAttention(3, 24, bf16, bf16Histories).configuration ==
+              VerifyAttentionConfig{},
+          "INT8 calibration leaked into the BF16 policy");
+  require(!plans.prefillAttention(2048, 24, bf16, 2049).sameExecutionAs(
+              plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 2049)),
+          "different cache formats aliased the same execution plan");
   require(plans.prefillAttention(2048, 24, layout(attentionShapes[0], 64), 0).sameExecutionAs(
               plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 0)),
           "layer count leaked into one-layer plan identity");
@@ -415,6 +468,7 @@ void atomicInvalidChoices() {
   invalid([](auto &c) { c.draftAttention[0].workload.shape.dynamicSize = 256; });
   invalid([](auto &c) { c.draftAttention[0].workload.lanes = 0; });
   invalid([](auto &c) { c.moe[0].configuration.expertTile = MoeExpertTile(16); });
+  invalid([](auto &c) { c.moe[0].configuration.m8Simdgroups = MoeExpertSimdgroups(6); });
   invalid([](auto &c) { c.moe[0].workload.rows = 9; });
   invalid([](auto &c) { c.moe[0].workload.rows = 40; });
   invalid([](auto &c) { c.moe[0].workload.phase = MoePhase(255); });
@@ -468,12 +522,14 @@ void invalidLookupsAndContextEdges() {
 int main() {
   try {
     baselinePlans();
+    moeDeviceTiles();
     allCandidates();
     policyKeysAndBounds();
     atomicInvalidChoices();
     invalidLookupsAndContextEdges();
-    std::cout << "PASS execution plans: typed policies, atomic install, all candidates, "
-                 "B1-B4 and prefill workspace bounds (CPU only)\n";
+    std::cout << "PASS execution plans: typed policies, device MoE tiles, atomic "
+                 "install, all candidates, B1-B4 and prefill workspace bounds "
+                 "(CPU only)\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL execution plans: " << error.what() << '\n';

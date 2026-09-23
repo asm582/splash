@@ -36,7 +36,7 @@ QwenTargetGeometry commonGeometry(const Layout &layout) {
   result.gdnHeadDimension = layout.gdnHeadDimension;
   result.maskToken = layout.maskToken;
   result.stopTokens = layout.stopTokens;
-  result.kvLayout = layout.q8Layout();
+  result.kvLayout = layout.kvLayout();
   result.stateLayout = layout.gdnStateLayout();
   result.captureLayerCount =
       static_cast<uint32_t>(layout.hiddenCaptureLayers.size());
@@ -134,17 +134,19 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
 
 QwenTarget::QwenTarget(const Qwen3_8Weights &weights,
                        metal::MetalBackend &backend,
-                       const ops::ExecutionPlans &operators)
+                       const ops::ExecutionPlans &operators, kv::Format format)
     : weights_(&weights), geometry_(qwenTargetGeometry(weights)),
       backend_(backend), operators_(operators) {
+  geometry_.kvLayout.format = format;
   requireWeights(weights, geometry_);
 }
 
 QwenTarget::QwenTarget(const Qwen3_6MoeWeights &weights,
                        metal::MetalBackend &backend,
-                       const ops::ExecutionPlans &operators)
+                       const ops::ExecutionPlans &operators, kv::Format format)
     : weights_(&weights), geometry_(qwenTargetGeometry(weights)),
       backend_(backend), operators_(operators) {
+  geometry_.kvLayout.format = format;
   requireWeights(weights, geometry_);
 }
 
@@ -165,7 +167,7 @@ const ops::Q4Projection &QwenTarget::vocabularyProjection() const noexcept {
 void QwenTarget::addPrefill(
     metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
     std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-    std::span<const kv::Q8LayerStorage> kvLayers) const {
+    std::span<const kv::LayerStorage> kvLayers) const {
   std::visit(
       [&](const auto *weights) {
         addPrefillImpl(*weights, graph, std::move(buffers), sequences, rows,
@@ -179,7 +181,7 @@ void QwenTarget::addPrefillImpl(
     const Weights &weights, metal::CommandGraph &graph,
     QwenTargetPrefillBuffers buffers,
     std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-    std::span<const kv::Q8LayerStorage> kvLayers) const {
+    std::span<const kv::LayerStorage> kvLayers) const {
   if (sequences.empty() ||
       sequences.size() > ExecutionLimits::maximumBatchWidth || !rows ||
       rows > ExecutionLimits::prefillTokenBudget ||
@@ -388,7 +390,7 @@ void QwenTarget::addPrefillImpl(
 
 void QwenTarget::addVerify(
     metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
-    std::span<const kv::Q8LayerStorage> kvLayers,
+    std::span<const kv::LayerStorage> kvLayers,
     std::span<const kv::Q8ChunkedPrefillParams> q8,
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
     ops::Q4DispatchStats &stats) const {
@@ -404,7 +406,7 @@ template <class Weights>
 void QwenTarget::addVerifyImpl(
     const Weights &weights, metal::CommandGraph &graph,
     QwenTargetVerifyBuffers buffers,
-    std::span<const kv::Q8LayerStorage> kvLayers,
+    std::span<const kv::LayerStorage> kvLayers,
     std::span<const kv::Q8ChunkedPrefillParams> q8,
     std::span<const kv::Q8VerifyAttentionParams> verify, uint32_t lanes,
     ops::Q4DispatchStats &stats) const {
@@ -443,7 +445,7 @@ void QwenTarget::addVerifyImpl(
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
     metal::MetalBuffer output = buffers.hidden[(layerIndex & 1) ^ 1];
     ops::Normalization::addRms(graph, input, layer.inputNorm,
-                               buffers.normalized, geometry_.hiddenSize, rows);
+                               buffers.normalized, geometry_.hiddenSize, rows, buffers.linearScratch);
 
     metal::MetalBuffer residual;
     std::visit(
@@ -452,7 +454,7 @@ void QwenTarget::addVerifyImpl(
             operators_.linear().addDecodeBatch(graph,
                                buffers.normalized, mixer.inputProjection,
                                buffers.gdnPacked[gdnIndex], gdnInput, lanes,
-                               stats);
+                               stats, buffers.linearScratch, true);
             ops::GDN::addDecode(
                 graph,
                 {buffers.gdnPacked[gdnIndex], mixer.convolutionWeights,
@@ -460,7 +462,7 @@ void QwenTarget::addVerifyImpl(
                  buffers.gdnMixed[gdnIndex], mixer.decay, mixer.timeBias,
                  buffers.gdnDecay[gdnIndex], buffers.gdnBeta[gdnIndex],
                  buffers.recurrent, mixer.mixerNorm, buffers.gdnHidden,
-                 buffers.arrived, buffers.generation},
+                 buffers.arrived, buffers.generation, buffers.linearScratch},
                 geometry_.gdnShape(), lanes, gdnIndex,
                 {geometry_.stateLayout.convolutionLayerBytes(),
                  geometry_.stateLayout.recurrentLayerBytes(),
@@ -468,14 +470,14 @@ void QwenTarget::addVerifyImpl(
             operators_.linear().addResidualBatch(
                 graph, buffers.gdnHidden,
                 mixer.outputProjection, input, buffers.gdnOutput, mixerOutput,
-                lanes, stats);
+                lanes, stats, buffers.linearScratch, true);
             residual = buffers.gdnOutput;
             ++gdnIndex;
           } else {
             operators_.linear().addDecodeBatch(graph,
                                buffers.normalized, mixer.inputProjection,
                                buffers.fullPacked, attentionInput, lanes,
-                               stats);
+                               stats, buffers.linearScratch, true);
             ops::PagedAttention::addVerifyProjection(
                 graph, buffers.fullPacked, mixer.queryNorm, mixer.keyNorm,
                 buffers.ropeCos, buffers.ropeSin, buffers.fullQueries,
@@ -494,11 +496,11 @@ void QwenTarget::addVerifyImpl(
                 graph, buffers.fullPacked, buffers.fullAttention,
                 buffers.attentionHidden, ExecutionLimits::targetVerifyRows,
                 tileRows, tileRows, geometry_.attentionQueryHeads,
-                geometry_.kvLayout, lanes);
+                geometry_.kvLayout, lanes, buffers.linearScratch);
             operators_.linear().addResidualBatch(
                 graph, buffers.attentionHidden,
                 mixer.outputProjection, input, buffers.attentionOutput,
-                mixerOutput, lanes, stats);
+                mixerOutput, lanes, stats, buffers.linearScratch, true);
             residual = buffers.attentionOutput;
             ++attentionIndex;
           }
@@ -506,16 +508,16 @@ void QwenTarget::addVerifyImpl(
         layer.mixer);
 
     ops::Normalization::addRms(graph, residual, layer.postAttentionNorm,
-                               buffers.normalized, geometry_.hiddenSize, rows);
+                               buffers.normalized, geometry_.hiddenSize, rows, buffers.linearScratch);
     if constexpr (hasDenseFfn<std::remove_cvref_t<decltype(layer)>>) {
       const ops::LinearMatrix up{geometry_.denseIntermediateSize, geometry_.hiddenSize};
       const ops::LinearMatrix down{geometry_.hiddenSize, geometry_.denseIntermediateSize};
       operators_.linear().addGateUpBatch(graph, buffers.normalized, layer.gateProjection,
                          layer.upProjection, buffers.denseGateScratch,
-                         buffers.denseIntermediate, up, lanes, stats);
+                         buffers.denseIntermediate, up, lanes, stats, buffers.linearScratch, true);
       operators_.linear().addResidualBatch(
           graph, buffers.denseIntermediate,
-          layer.downProjection, residual, output, down, lanes, stats);
+          layer.downProjection, residual, output, down, lanes, stats, buffers.linearScratch);
     } else {
       ops::MoE::add(
           graph,
@@ -545,18 +547,18 @@ void QwenTarget::addVerifyImpl(
                              std::visit([](const auto *value) {
                                return value->finalNorm;
                              }, weights_),
-                             buffers.finalHidden, geometry_.hiddenSize, rows);
+                             buffers.finalHidden, geometry_.hiddenSize, rows, buffers.linearScratch);
   const ops::LinearMatrix head{geometry_.vocabularySize, geometry_.hiddenSize};
   operators_.linear().addDecodeBatch(graph, buffers.finalHidden,
                      vocabularyProjection(), buffers.logits, head, lanes,
-                     stats);
+                     stats, buffers.linearScratch, true);
 }
 
 void QwenTarget::addHead(metal::CommandGraph &graph,
                          metal::MetalBuffer hidden,
                          metal::MetalBuffer finalHidden,
                          metal::MetalBuffer logits,
-                         uint32_t normalizedRows) const {
+                         uint32_t normalizedRows, ops::LinearScratch scratch) const {
   if (!normalizedRows ||
       normalizedRows > ExecutionLimits::targetVerifyRows) {
     throw std::invalid_argument("invalid Qwen head row count");
@@ -568,7 +570,7 @@ void QwenTarget::addHead(metal::CommandGraph &graph,
   const ops::LinearMatrix head{geometry_.vocabularySize, geometry_.hiddenSize};
   operators_.linear().addDecode(graph,
                 std::move(finalHidden), vocabularyProjection(),
-                std::move(logits), head);
+                std::move(logits), head, scratch);
 }
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
