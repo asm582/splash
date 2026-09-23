@@ -641,6 +641,41 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assertEqual(wire[span_offset + 32 :], image.image_pixels)
         self.assertEqual(p.decode_frame(parse_all(wire)[0]), image)
 
+    def test_token_words_must_be_exact_uint32_ints(self):
+        base = example_request()
+        bad_values = (
+            True,
+            p.Cohort.GREEDY,
+            -1,
+            0x100000000,
+            1.0,
+            "1",
+            None,
+        )
+        for field, message in (
+            ("prompt_tokens", "prompt tokens element"),
+            ("score_tokens", "score tokens element"),
+        ):
+            # A bad word is caught wherever it sits, including the last one.
+            for position in (0, 4):
+                for bad in bad_values:
+                    words = [*range(5)]
+                    words[position] = bad
+                    with self.subTest(field=field, position=position, bad=bad):
+                        request = replace(base, **{field: tuple(words)})
+                        with self.assertRaises(p.ProtocolError) as raised:
+                            p.serialize_message(request)
+                        self.assertEqual(
+                            raised.exception.issue.code, p.IssueCode.LIMIT_EXCEEDED
+                        )
+                        self.assertIn(
+                            f"{message} must be an integer in [0, 4294967295]",
+                            raised.exception.issue.message,
+                        )
+        with self.assertRaises(p.ProtocolError) as raised:
+            p.serialize_message(replace(base, prompt_tokens=[1, 2, 3]))
+        self.assertIn("must be a tuple of uint32", raised.exception.issue.message)
+
     def test_refresh_request_deadline_changes_only_the_absolute_deadline(self):
         request = example_request()
         wire = p.serialize_message(request)

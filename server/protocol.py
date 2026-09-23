@@ -442,6 +442,14 @@ def _bytes(value: object, label: str) -> bytes:
 def _words(values: object, label: str) -> tuple[int, ...]:
     if type(values) is not tuple:
         raise ValueError(f"{label} must be a tuple of uint32 values")
+    # Prompts run to a million words, so accept the common valid case in C.
+    # Anything else falls through to the per-word check for its exact error.
+    if (
+        set(map(type, values)) == {int}
+        and min(values) >= 0
+        and max(values) <= 0xFFFFFFFF
+    ):
+        return values
     return tuple(_u32(value, f"{label} element") for value in values)
 
 
