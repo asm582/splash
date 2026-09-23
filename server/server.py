@@ -395,6 +395,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "created": 0,
                     "owned_by": "splash",
                     "max_model_len": self.app.max_context,
+                    "context_length": self.app.max_context,
                     **({"root": self.app.model} if name != self.app.model else {}),
                 }
                 for name in self.app.model_names

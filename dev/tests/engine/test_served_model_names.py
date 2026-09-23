@@ -56,6 +56,7 @@ class ServedModelNamesTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 for model in json.loads(payload)["data"]:
                     self.assertEqual(model["max_model_len"], context)
+                    self.assertEqual(model["context_length"], context)
                     status, _, detail = harness.request(
                         "GET", "/v1/models/" + quote(model["id"], safe="")
                     )
